@@ -85,6 +85,7 @@ struct StickerCanvasView: View {
                         showTrashZone = false
                         trashIsTargeted = false
                     }
+<<<<<<< HEAD
                 },
                 onStickerGestureStart: {
                     saveUndoState()
@@ -104,26 +105,18 @@ struct StickerCanvasView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    // PhotosPicker handles the tap naturally.
-                    // A DragGesture sits alongside it — dragging down
-                    // opens the menu without interfering with the tap.
+                    // Tap opens Photos directly. Long-press opens the full menu.
                     PhotosPicker(selection: $selectedItem, matching: .images) {
                         Image(systemName: "plus")
                             .font(.system(size: 17, weight: .semibold))
                             .frame(width: 44, height: 44)
                     }
                     .simultaneousGesture(
-                        DragGesture(minimumDistance: 10, coordinateSpace: .global)
-                            .onChanged { value in
-                                guard !showPlusMenu else { return }
-                                let dy = value.translation.height
-                                let dx = abs(value.translation.width)
-                                // Only trigger on a clearly downward drag
-                                if dy > 18 && dy > dx * 1.5 {
-                                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                                    withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
-                                        showPlusMenu = true
-                                    }
+                        LongPressGesture(minimumDuration: 0.4)
+                            .onEnded { _ in
+                                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+                                    showPlusMenu = true
                                 }
                             }
                     )

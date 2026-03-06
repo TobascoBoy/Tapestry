@@ -76,6 +76,11 @@ final class MusicPlayerManager: ObservableObject {
         isPlaying = false
     }
 
+    func resume() {
+        player?.play()
+        isPlaying = true
+    }
+
     func stop() {
         if let observer = timeObserver {
             player?.removeTimeObserver(observer)
