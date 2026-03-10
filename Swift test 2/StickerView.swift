@@ -12,6 +12,8 @@ final class StickerCoordinator: NSObject, UIGestureRecognizerDelegate {
     var onGestureEnd: (() -> Void)?
     var onDragChanged: ((CGPoint) -> Void)?   // screen-space position while dragging
     var onDragEnded: ((CGPoint) -> Void)?     // screen-space position on release
+    var onLongPress: (() -> Void)?            // override for long-press (e.g. text re-edit)
+    var onDoubleTap: (() -> Void)?            // double-tap to enter lasso mode
     weak var panGesture: UIPanGestureRecognizer?
     var isGesturing = false
 
@@ -33,6 +35,9 @@ final class StickerCoordinator: NSObject, UIGestureRecognizerDelegate {
         onTapSelect()
     }
 
+    @objc func handleDoubleTap(_ gr: UITapGestureRecognizer) {
+        onDoubleTap?()
+    }
 
     @objc func handlePan(_ gr: UIPanGestureRecognizer) {
         guard let view = gr.view else { return }
@@ -104,7 +109,11 @@ final class StickerCoordinator: NSObject, UIGestureRecognizerDelegate {
 
     @objc func handleLongPress(_ gr: UILongPressGestureRecognizer) {
         guard gr.state == .began else { return }
-        Task { await removeBackground() }
+        if let onLongPress {
+            onLongPress()
+        } else {
+            Task { await removeBackground() }
+        }
     }
 
     @MainActor
@@ -147,6 +156,7 @@ final class StickerUIView: UIView {
     let imageView = UIImageView()
     private let border = UIView()
     private weak var coordinator: StickerCoordinator?
+    var usesBoundingBoxHitTest = false
 
     init(coordinator: StickerCoordinator) {
         self.coordinator = coordinator
@@ -181,6 +191,8 @@ final class StickerUIView: UIView {
         guard let coord = coordinator else { return }
 
         let tap = UITapGestureRecognizer(target: coord, action: #selector(StickerCoordinator.handleTap))
+        let doubleTap = UITapGestureRecognizer(target: coord, action: #selector(StickerCoordinator.handleDoubleTap))
+        doubleTap.numberOfTapsRequired = 2
         let pan = UIPanGestureRecognizer(target: coord, action: #selector(StickerCoordinator.handlePan))
         let pinch = UIPinchGestureRecognizer(target: coord, action: #selector(StickerCoordinator.handlePinch))
         let rotate = UIRotationGestureRecognizer(target: coord, action: #selector(StickerCoordinator.handleRotate))
@@ -192,22 +204,36 @@ final class StickerUIView: UIView {
         rotate.delegate = coord
         coord.panGesture = pan
 
-        for g in [tap, pan, pinch, rotate, longPress] {
+        for g in [tap, doubleTap, pan, pinch, rotate, longPress] {
             addGestureRecognizer(g)
         }
     }
 
     func configure(image: UIImage, isSelected: Bool) {
-        if imageView.image !== image {
-            imageView.image = image
+        if let frames = image.images, !frames.isEmpty {
+            // Animated GIF — drive UIImageView's built-in frame animation
+            if imageView.animationImages?.first !== frames.first {
+                imageView.animationImages   = frames
+                imageView.animationDuration = image.duration
+                imageView.image             = frames[0]   // poster frame while setting up
+            }
+            if !imageView.isAnimating { imageView.startAnimating() }
+        } else {
+            // Static image
+            if imageView.image !== image {
+                imageView.stopAnimating()
+                imageView.animationImages = nil
+                imageView.image = image
+            }
         }
         border.isHidden = !isSelected
         layer.shadowRadius = isSelected ? 10 : 6
         coordinator?.panGesture?.isEnabled = isSelected
     }
 
-    // Hit-test only on non-transparent pixels
+    // Hit-test only on non-transparent pixels (skipped for text stickers)
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        if usesBoundingBoxHitTest { return super.point(inside: point, with: event) }
         guard let image = imageView.image, let cgImage = image.cgImage else {
             return super.point(inside: point, with: event)
         }

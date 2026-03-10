@@ -1,15 +1,19 @@
 import SwiftUI
-import PhotosUI
+import UIKit
 
 // MARK: - Menu item enum
 
 enum PlusMenuItem {
+    case photo
+    case text
     case background
     case music
     case video
 
     var label: String {
         switch self {
+        case .photo:      return "Photo"
+        case .text:       return "Text"
         case .background: return "Background"
         case .music:      return "Music"
         case .video:      return "Video"
@@ -17,6 +21,8 @@ enum PlusMenuItem {
     }
     var icon: String {
         switch self {
+        case .photo:      return "photo.fill"
+        case .text:       return "textformat"
         case .background: return "paintpalette.fill"
         case .music:      return "music.note"
         case .video:      return "video.fill"
@@ -24,6 +30,8 @@ enum PlusMenuItem {
     }
     var color: Color {
         switch self {
+        case .photo:      return .blue
+        case .text:       return .teal
         case .background: return .orange
         case .music:      return .pink
         case .video:      return .purple
@@ -46,9 +54,11 @@ struct PlusMenuOverlay: View {
                 .onTapGesture { dismiss() }
 
             VStack(alignment: .trailing, spacing: 12) {
-                menuRow(.background, index: 0)
-                menuRow(.music,      index: 1)
-                menuRow(.video,      index: 2)
+                menuRow(.photo,      index: 0)
+                menuRow(.text,       index: 1)
+                menuRow(.background, index: 2)
+                menuRow(.music,      index: 3)
+                menuRow(.video,      index: 4)
             }
             .padding(.top, 8)
             .padding(.trailing, 16)

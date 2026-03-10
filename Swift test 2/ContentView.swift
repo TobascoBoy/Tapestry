@@ -2,10 +2,12 @@ import SwiftUI
 
 struct ContentView: View {
     var body: some View {
-        StickerCanvasView()
+        ProfileView()
     }
 }
 
 #Preview {
     ContentView()
+        .environment(TapestryStore())
+        .environment(AuthManager())
 }

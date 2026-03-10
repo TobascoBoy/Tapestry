@@ -219,7 +219,12 @@ final class MusicStickerCoordinator: NSObject, UIGestureRecognizerDelegate {
     }
 
     func gestureRecognizer(_ gr: UIGestureRecognizer,
-                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
+                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        // Only allow simultaneous recognition with gestures on the same view.
+        // Returning true unconditionally lets the canvas pan fire at the same time,
+        // causing the background to move while dragging the sticker.
+        return gr.view === other.view
+    }
 
     @objc func handleTap(_ gr: UITapGestureRecognizer) { onTapSelect?() }
 

@@ -24,7 +24,6 @@ final class VideoStickerUIView: UIView {
 
     // Overlays
     private let border        = UIView()
-    private let holdLabel     = UILabel()
 
     weak var coordinator: VideoStickerCoordinator?
 
@@ -64,14 +63,6 @@ final class VideoStickerUIView: UIView {
         thumbnailView.backgroundColor = .clear
         container.addSubview(thumbnailView)
 
-        // "HOLD" hint — no background, just subtle text in corner
-        holdLabel.text          = "HOLD"
-        holdLabel.font          = .systemFont(ofSize: 10, weight: .semibold)
-        holdLabel.textColor     = UIColor.white.withAlphaComponent(0.75)
-        holdLabel.backgroundColor = .clear
-        holdLabel.frame         = CGRect(x: 10, y: s - 20, width: 36, height: 14)
-        addSubview(holdLabel)
-
         // Selection border
         border.frame                   = f
         border.layer.cornerRadius      = r
@@ -85,25 +76,25 @@ final class VideoStickerUIView: UIView {
 
         // Gestures
         guard let coord = coordinator else { return }
-        let tap    = UITapGestureRecognizer(target: coord, action: #selector(VideoStickerCoordinator.handleTap))
+        let tap       = UITapGestureRecognizer(target: coord, action: #selector(VideoStickerCoordinator.handleTap))
+        let doubleTap = UITapGestureRecognizer(target: coord, action: #selector(VideoStickerCoordinator.handleDoubleTap))
+        doubleTap.numberOfTapsRequired = 2
         let pan    = UIPanGestureRecognizer(target: coord, action: #selector(VideoStickerCoordinator.handlePan))
         let pinch  = UIPinchGestureRecognizer(target: coord, action: #selector(VideoStickerCoordinator.handlePinch))
         let rotate = UIRotationGestureRecognizer(target: coord, action: #selector(VideoStickerCoordinator.handleRotate))
-        let hold   = UILongPressGestureRecognizer(target: self, action: #selector(handleHold))
-        hold.minimumPressDuration = 0.15
-        [pan, pinch, rotate, hold].forEach { $0.delegate = coord }
+        [pan, pinch, rotate].forEach { $0.delegate = coord }
         coord.panGesture = pan
-        [tap, pan, pinch, rotate, hold].forEach { addGestureRecognizer($0) }
+        [tap, doubleTap, pan, pinch, rotate].forEach { addGestureRecognizer($0) }
     }
 
     // MARK: - Configure
 
     func configure(videoURL: URL, thumbnail: UIImage, isSelected: Bool, bgRemoved: Bool) {
         isBgRemoved = bgRemoved
-        if player == nil { buildPlayer(url: videoURL, bgRemoved: bgRemoved) }
+        let firstBuild = player == nil
+        if firstBuild { buildPlayer(url: videoURL, bgRemoved: bgRemoved) }
 
-        border.isHidden  = !isSelected
-        holdLabel.isHidden = false   // always show — same hint regardless of bg removal
+        border.isHidden = !isSelected
         coordinator?.panGesture?.isEnabled = isSelected
 
         if bgRemoved {
@@ -111,13 +102,18 @@ final class VideoStickerUIView: UIView {
             layer.shadowOpacity = 0
         } else {
             container.isHidden  = false
-            thumbnailView.image = thumbnail
-            // Shadow only on raw video (opaque rectangle)
-            layer.shadowColor   = UIColor.black.cgColor
-            layer.shadowOpacity = 0.3
-            layer.shadowRadius  = 10
-            layer.shadowOffset  = CGSize(width: 0, height: 3)
+            // Hide the static thumbnail immediately — the looping player takes over
+            thumbnailView.image  = thumbnail
+            thumbnailView.alpha  = 0
+            playerLayer?.opacity = 1
+            layer.shadowColor    = UIColor.black.cgColor
+            layer.shadowOpacity  = 0.3
+            layer.shadowRadius   = 10
+            layer.shadowOffset   = CGSize(width: 0, height: 3)
         }
+
+        // Start looping playback — no-op if already playing
+        if player?.rate == 0 { player?.play() }
     }
 
     // MARK: - Player construction
@@ -163,11 +159,11 @@ final class VideoStickerUIView: UIView {
         let vo = AVPlayerItemVideoOutput(outputSettings: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
         ])
-        // Add output to the looper's current item once ready
+        // Add output to the looper's current item once ready, then play continuously
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self, weak qp] in
             qp?.currentItem?.add(vo)
             self?.videoOutput = vo
-            self?.showFirstFrame()
+            qp?.play()
         }
 
         // CADisplayLink pushes frames to sampleLayer
@@ -191,18 +187,6 @@ final class VideoStickerUIView: UIView {
               let pb = vo.copyPixelBuffer(forItemTime: t, itemTimeForDisplay: nil) else { return }
         // Flush before first frame of each loop to reset sampleLayer timeline
         push(pb, at: t, to: sl)
-    }
-
-    private func showFirstFrame() {
-        guard let vo = videoOutput, let sl = sampleLayer, let p = player else { return }
-        let t = CMTime(seconds: 0.05, preferredTimescale: 600)
-        p.seek(to: t, toleranceBefore: .zero,
-               toleranceAfter: CMTime(seconds: 0.1, preferredTimescale: 600)) { [weak self] _ in
-            guard let self,
-                  let pb = self.videoOutput?.copyPixelBuffer(forItemTime: t, itemTimeForDisplay: nil)
-            else { return }
-            self.push(pb, at: t, to: sl)
-        }
     }
 
     private var lastPushedTime: CMTime = .invalid
@@ -232,41 +216,6 @@ final class VideoStickerUIView: UIView {
         if sl.isReadyForMoreMediaData { sl.enqueue(sb) }
     }
 
-    // MARK: - Hold gesture
-
-    @objc private func handleHold(_ gr: UILongPressGestureRecognizer) {
-        switch gr.state {
-        case .began:
-            player?.seek(to: .zero) { [weak self] _ in self?.player?.play() }
-            if !isBgRemoved {
-                UIView.animate(withDuration: 0.12) {
-                    self.thumbnailView.alpha = 0
-                    self.playerLayer?.opacity = 1
-                }
-            }
-            UIView.animate(withDuration: 0.15, delay: 0,
-                           usingSpringWithDamping: 0.7, initialSpringVelocity: 0) {
-                self.transform = self.transform.scaledBy(x: 1.04, y: 1.04)
-            }
-        case .ended, .cancelled, .failed:
-            player?.pause()
-            if isBgRemoved {
-                player?.seek(to: .zero) { [weak self] _ in self?.showFirstFrame() }
-            } else {
-                player?.seek(to: .zero)
-                UIView.animate(withDuration: 0.2) {
-                    self.thumbnailView.alpha  = 1
-                    self.playerLayer?.opacity = 0
-                }
-            }
-            UIView.animate(withDuration: 0.2, delay: 0,
-                           usingSpringWithDamping: 0.7, initialSpringVelocity: 0) {
-                self.transform = self.transform.scaledBy(x: 1/1.04, y: 1/1.04)
-            }
-        default: break
-        }
-    }
-
     // MARK: - Helpers
 
     private func cleanup() {
@@ -285,6 +234,7 @@ final class VideoStickerUIView: UIView {
 final class VideoStickerCoordinator: NSObject, UIGestureRecognizerDelegate {
     let stickerID:         UUID
     var onTapSelect:       (() -> Void)?
+    var onDoubleTap:       (() -> Void)?
     var onGestureStart:    (() -> Void)?
     var onGestureEnd:      (() -> Void)?
     var onDragChanged:     ((CGPoint) -> Void)?
@@ -303,9 +253,16 @@ final class VideoStickerCoordinator: NSObject, UIGestureRecognizerDelegate {
     init(stickerID: UUID) { self.stickerID = stickerID }
 
     func gestureRecognizer(_ gr: UIGestureRecognizer,
-                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
+                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        // Only allow simultaneous recognition with gestures on the same view.
+        // Returning true unconditionally lets the canvas pan fire at the same time,
+        // causing the background to move while dragging the sticker.
+        return gr.view === other.view
+    }
 
     @objc func handleTap(_ gr: UITapGestureRecognizer) { onTapSelect?() }
+
+    @objc func handleDoubleTap(_ gr: UITapGestureRecognizer) { onDoubleTap?() }
 
     @objc func handlePan(_ gr: UIPanGestureRecognizer) {
         guard let v = gr.view else { return }
