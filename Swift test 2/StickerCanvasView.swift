@@ -58,6 +58,9 @@ struct StickerCanvasView: View {
     @State private var showTextSticker = false
     @State private var textEditTarget: TextEditTarget?
 
+    // Layers panel
+    @State private var showLayersPanel = false
+
     // Undo
     @State private var undoStack: [CanvasSnapshot] = []
 
@@ -72,10 +75,18 @@ struct StickerCanvasView: View {
                 canvasOffset: $canvasOffset,
                 canvasBackground: canvasBackground,
                 canvasMode: canvasMode,
-                onTapEmpty: { selectedStickerID = nil },
+                onTapEmpty: {
+                    selectedStickerID = nil
+                    if showLayersPanel {
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) { showLayersPanel = false }
+                    }
+                },
                 onTapSticker: { id in
                     selectedStickerID = id
                     bringToFront(stickerID: id)
+                    if showLayersPanel {
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) { showLayersPanel = false }
+                    }
                 },
                 onDragChanged: { screenPos in
                     let screenHeight = UIScreen.main.bounds.height
@@ -129,17 +140,27 @@ struct StickerCanvasView: View {
             }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 17, weight: .semibold))
-                        .frame(width: 44, height: 44)
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                            withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
-                                showPlusMenu = true
-                            }
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+                            showLayersPanel.toggle()
                         }
+                    } label: {
+                        Image(systemName: "square.3.layers.3d")
+                            .font(.system(size: 17, weight: .semibold))
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+                            showPlusMenu = true
+                        }
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: 17, weight: .semibold))
+                    }
                 }
             }
             .photosPicker(isPresented: $showPhotosPicker, selection: $selectedItem, matching: .images)
@@ -168,6 +189,31 @@ struct StickerCanvasView: View {
                         },
                         onDismiss: { showPlusMenu = false }
                     )
+                }
+            }
+            .overlay(alignment: .leading) {
+                if showLayersPanel {
+                    LayersPanelView(
+                        stickers: stickers,
+                        onSelect: { id in
+                            selectedStickerID = id
+                            bringToFront(stickerID: id)
+                        },
+                        onDismiss: {
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+                                showLayersPanel = false
+                            }
+                        },
+                        onReorder: { orderedIDs in
+                            saveUndoState()
+                            for (position, id) in orderedIDs.enumerated() {
+                                if let idx = stickers.firstIndex(where: { $0.id == id }) {
+                                    stickers[idx].zIndex = Double(orderedIDs.count - position)
+                                }
+                            }
+                        }
+                    )
+                    .transition(.move(edge: .leading).combined(with: .opacity))
                 }
             }
             .sheet(isPresented: $showVideoPicker) {
@@ -234,7 +280,10 @@ struct StickerCanvasView: View {
                 backgroundSheet
             }
             .onAppear  { DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { loadCanvas() } }
-            .onDisappear { saveCanvas() }
+            .onDisappear {
+                saveCanvas()
+                autoSaveThumbnail()
+            }
     }
 
     // MARK: - Canvas Persistence
@@ -307,7 +356,7 @@ struct StickerCanvasView: View {
         let stickerSnapshot    = stickers
         let backgroundSnapshot = canvasBackground
 
-        Task.detached(priority: .utility) { [store] in
+        Task(priority: .utility) { [store] in
             var stickerStates: [StickerState] = []
             for sticker in stickerSnapshot {
                 var s = StickerState(
@@ -376,6 +425,14 @@ struct StickerCanvasView: View {
                   let json = String(data: data, encoding: .utf8) else { return }
 
             await MainActor.run { store.updateCanvas(tapestryID: tid, canvasJSON: json) }
+        }
+    }
+
+    private func autoSaveThumbnail() {
+        guard let tid = tapestryID, !coverPickerMode,
+              let img = canvasUIView?.renderViewportThumbnail() else { return }
+        if let filename = store.saveThumbnail(img, for: tid) {
+            store.updateThumbnailFilename(tapestryID: tid, filename: filename)
         }
     }
 

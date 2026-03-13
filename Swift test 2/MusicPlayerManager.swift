@@ -19,10 +19,16 @@ final class MusicPlayerManager: ObservableObject {
 
     private var player: AVPlayer?
     private var timeObserver: Any?
+    private var finishObserver: NSObjectProtocol?
     private var itemObserver: AnyCancellable?
 
+    // Dedicated background queue for the periodic time observer.
+    // AVFoundation requires removeTimeObserver to be called on the same queue
+    // it was registered on. Using a background (non-main) queue means removal
+    // never blocks or deadlocks the main thread.
+    private let observerQueue = DispatchQueue(label: "com.tapestry.music.timeobserver", qos: .userInteractive)
+
     private init() {
-        // Allow audio to play over silent mode switch
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
         try? AVAudioSession.sharedInstance().setActive(true)
     }
@@ -30,43 +36,55 @@ final class MusicPlayerManager: ObservableObject {
     // MARK: - Public API
 
     func play(stickerID: UUID, url: URL) {
-        // If this card is already playing, pause it
         if currentlyPlayingID == stickerID && isPlaying {
             pause()
             return
         }
 
-        // Stop whatever was playing before
         stop()
 
         let item = AVPlayerItem(url: url)
-        player = AVPlayer(playerItem: item)
+        let newPlayer = AVPlayer(playerItem: item)
+        player = newPlayer
 
-        // Observe duration once item is ready
+        // Observe status for duration
         itemObserver = item.publisher(for: \.status)
             .receive(on: RunLoop.main)
-            .sink { [weak self] status in
-                if status == .readyToPlay {
-                    self?.duration = item.asset.duration.seconds
+            .sink { [weak self, weak newPlayer] status in
+                guard status == .readyToPlay else { return }
+                Task { @MainActor [weak self, weak newPlayer] in
+                    guard let asset = newPlayer?.currentItem?.asset,
+                          let dur = try? await asset.load(.duration) else { return }
+                    let secs = dur.seconds
+                    if secs.isFinite && secs > 0 { self?.duration = secs }
                 }
             }
 
-        // Time observer for progress bar
+        // Register time observer on a background queue to avoid deadlocking
+        // when removeTimeObserver is called from the main thread via @MainActor
         let interval = CMTime(seconds: 0.1, preferredTimescale: 600)
-        timeObserver = player?.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
-            guard let self, let dur = self.player?.currentItem?.duration.seconds, dur > 0 else { return }
-            self.progress = time.seconds / dur
+        timeObserver = newPlayer.addPeriodicTimeObserver(forInterval: interval, queue: observerQueue) { [weak self, weak newPlayer] time in
+            guard let dur = newPlayer?.currentItem?.duration.seconds,
+                  dur.isFinite && dur > 0 else { return }
+            let prog = time.seconds / dur
+            DispatchQueue.main.async { [weak self, weak newPlayer] in
+                guard let self, self.player === newPlayer else { return }
+                self.progress = prog
+            }
         }
 
-        // Auto-stop at end
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(playerDidFinish),
-            name: .AVPlayerItemDidPlayToEndTime,
-            object: item
-        )
+        // Block-based observer — token-based removal never crashes,
+        // unlike the old selector-based removeObserver(self:) which could crash
+        // when called from a Swift @MainActor Task context
+        finishObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.stop() }
+        }
 
-        player?.play()
+        newPlayer.play()
         currentlyPlayingID = stickerID
         isPlaying = true
     }
@@ -82,21 +100,29 @@ final class MusicPlayerManager: ObservableObject {
     }
 
     func stop() {
-        if let observer = timeObserver {
-            player?.removeTimeObserver(observer)
+        itemObserver = nil
+        // Remove time observer on the same background queue it was registered on.
+        // Async dispatch means this never blocks the main thread.
+        // The player is captured strongly so it lives until removeTimeObserver finishes.
+        if let token = timeObserver, let p = player {
+            let capturedPlayer = p
+            let capturedToken = token
             timeObserver = nil
+            observerQueue.async {
+                capturedPlayer.removeTimeObserver(capturedToken)
+            }
         }
-        NotificationCenter.default.removeObserver(self, name: .AVPlayerItemDidPlayToEndTime, object: nil)
+
+        if let obs = finishObserver {
+            NotificationCenter.default.removeObserver(obs)
+            finishObserver = nil
+        }
+
         player?.pause()
         player = nil
-        itemObserver = nil
         currentlyPlayingID = nil
         isPlaying = false
         progress = 0
         duration = 0
-    }
-
-    @objc private func playerDidFinish() {
-        stop()
     }
 }

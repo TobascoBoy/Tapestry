@@ -6,6 +6,8 @@ struct CreateTapestryView: View {
     @Environment(TapestryStore.self) private var store
     @Environment(\.dismiss) private var dismiss
 
+    var tapestryType: TapestryType = .personal
+
     @State private var title = ""
     @State private var description = ""
     @State private var titleError: String?
@@ -26,7 +28,7 @@ struct CreateTapestryView: View {
                 .padding(.top, 20)
             }
             .background(Color(.systemGroupedBackground))
-            .navigationTitle("New Tapestry")
+            .navigationTitle(tapestryType == .group ? "New Group Tapestry" : "New Tapestry")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -149,7 +151,7 @@ struct CreateTapestryView: View {
         let tapestry = Tapestry(
             title: trimmed,
             description: description.trimmingCharacters(in: .whitespaces),
-            type: .personal
+            type: tapestryType
         )
         store.add(tapestry)
         store.setCanvasMode(tapestryID: tapestry.id, mode: canvasMode)

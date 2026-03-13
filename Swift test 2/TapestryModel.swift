@@ -5,9 +5,10 @@ import Supabase
 
 // MARK: - Tapestry Type
 
-enum TapestryType: String, Codable {
+enum TapestryType: String, Codable, Identifiable {
     case personal
     case group
+    var id: Self { self }
 }
 
 // MARK: - Tapestry Model
