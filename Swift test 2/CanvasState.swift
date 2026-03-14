@@ -38,6 +38,9 @@ struct StickerState: Codable {
     var textString:       String?
     var fontIndex:        Int?
     var colorIndex:       Int?
+    var textWrapWidth:    Double?
+    var textAlignment:    Int?
+    var textBGStyle:      Int?
 
     // music
     var musicID:                    String?

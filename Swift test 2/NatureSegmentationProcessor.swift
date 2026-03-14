@@ -27,13 +27,12 @@ final class NatureSegmentationProcessor {
         128   // lake
     ]
 
-    private let model: NatureSegmenter
+    private let model: NatureSegmenter?
 
     private init() {
-        guard let m = try? NatureSegmenter() else {
-            fatalError("NatureSegmenter.mlpackage not found in bundle")
-        }
-        model = m
+        print("[NatureSegmenter] loading model synchronously...")
+        model = try? NatureSegmenter()
+        print("[NatureSegmenter] model ready: \(model != nil)")
     }
 
     /// Runs SegFormer-B2 segmentation on `image`. If the pixel at `imagePoint`
@@ -51,7 +50,7 @@ final class NatureSegmentationProcessor {
                     continuation.resume(returning: nil)
                     return
                 }
-                guard let output = try? self.model.prediction(image: pixelBuffer) else {
+                guard let output = try? self.model?.prediction(image: pixelBuffer) else {
                     print("[NatureSegmenter] ❌ model prediction failed")
                     continuation.resume(returning: nil)
                     return

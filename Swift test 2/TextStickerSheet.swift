@@ -5,13 +5,36 @@ import UIKit
 
 let textStickerFontChoices: [FontChoice] = {
     var choices: [FontChoice] = []
+
+    // System variants
     choices.append(FontChoice(name: "Modern",  uiFont: .systemFont(ofSize: 64, weight: .semibold)))
     if let desc = UIFont.systemFont(ofSize: 64, weight: .bold).fontDescriptor.withDesign(.rounded) {
         choices.append(FontChoice(name: "Rounded", uiFont: UIFont(descriptor: desc, size: 64)))
     }
-    if let f = UIFont(name: "Georgia-Bold",          size: 64) { choices.append(FontChoice(name: "Serif",  uiFont: f)) }
-    if let f = UIFont(name: "CourierNewPS-BoldMT",   size: 64) { choices.append(FontChoice(name: "Mono",   uiFont: f)) }
-    if let f = UIFont(name: "SnellRoundhand-Bold",   size: 64) { choices.append(FontChoice(name: "Script", uiFont: f)) }
+
+    // Sans-serif
+    if let f = UIFont(name: "AvenirNext-Bold",             size: 64) { choices.append(FontChoice(name: "Avenir",      uiFont: f)) }
+    if let f = UIFont(name: "Futura-Bold",                 size: 64) { choices.append(FontChoice(name: "Futura",      uiFont: f)) }
+    if let f = UIFont(name: "GillSans-Bold",               size: 64) { choices.append(FontChoice(name: "Gill Sans",   uiFont: f)) }
+    if let f = UIFont(name: "Futura-CondensedExtraBold",   size: 64) { choices.append(FontChoice(name: "Condensed",   uiFont: f)) }
+
+    // Serif
+    if let f = UIFont(name: "Georgia-Bold",                size: 64) { choices.append(FontChoice(name: "Serif",       uiFont: f)) }
+    if let f = UIFont(name: "Baskerville-Bold",            size: 64) { choices.append(FontChoice(name: "Baskerville", uiFont: f)) }
+    if let f = UIFont(name: "Didot-Bold",                  size: 64) { choices.append(FontChoice(name: "Didot",       uiFont: f)) }
+    if let f = UIFont(name: "Copperplate-Bold",            size: 64) { choices.append(FontChoice(name: "Copperplate", uiFont: f)) }
+    if let f = UIFont(name: "AmericanTypewriter-Bold",     size: 64) { choices.append(FontChoice(name: "Typewriter",  uiFont: f)) }
+
+    // Handwriting / Display
+    if let f = UIFont(name: "SnellRoundhand-Bold",         size: 64) { choices.append(FontChoice(name: "Script",      uiFont: f)) }
+    if let f = UIFont(name: "BradleyHandITCTT-Bold",       size: 64) { choices.append(FontChoice(name: "Bradley",     uiFont: f)) }
+    if let f = UIFont(name: "Noteworthy-Bold",             size: 64) { choices.append(FontChoice(name: "Noteworthy",  uiFont: f)) }
+    if let f = UIFont(name: "MarkerFelt-Wide",             size: 64) { choices.append(FontChoice(name: "Marker",      uiFont: f)) }
+    if let f = UIFont(name: "Chalkduster",                 size: 64) { choices.append(FontChoice(name: "Chalk",       uiFont: f)) }
+
+    // Mono
+    if let f = UIFont(name: "CourierNewPS-BoldMT",         size: 64) { choices.append(FontChoice(name: "Mono",        uiFont: f)) }
+
     return choices
 }()
 
@@ -32,37 +55,70 @@ struct FontChoice: Identifiable {
 // MARK: - TextStickerContent
 
 struct TextStickerContent {
-    let text: String
-    let fontIndex: Int
+    let text:       String
+    let fontIndex:  Int
     let colorIndex: Int
-    let image: UIImage
+    let wrapWidth:  CGFloat  // render-space wrap width; drag corner handle to change
+    let alignment:  Int      // 0=left  1=center  2=right
+    let bgStyle:    Int      // 0=none  1=solid dark pill
+    let image:      UIImage
 
-    init(text: String, fontIndex: Int, colorIndex: Int) {
-        self.text = text
-        self.fontIndex = fontIndex
+    init(text: String, fontIndex: Int, colorIndex: Int,
+         wrapWidth: CGFloat = 900, alignment: Int = 1, bgStyle: Int = 1) {
+        self.text       = text
+        self.fontIndex  = fontIndex
         self.colorIndex = colorIndex
-        self.image = TextStickerContent.render(text: text, fontIndex: fontIndex, colorIndex: colorIndex)
+        self.wrapWidth  = wrapWidth
+        self.alignment  = alignment
+        self.bgStyle    = bgStyle
+        self.image = TextStickerContent.render(
+            text: text, fontIndex: fontIndex, colorIndex: colorIndex,
+            wrapWidth: wrapWidth, alignment: alignment, bgStyle: bgStyle)
     }
 
-    static func render(text: String, fontIndex: Int, colorIndex: Int) -> UIImage {
-        let font = textStickerFontChoices[safe: fontIndex]?.uiFont ?? .systemFont(ofSize: 64, weight: .semibold)
-        let color = textStickerColorOptions[safe: colorIndex] ?? .label
-        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
+    static func render(text: String, fontIndex: Int, colorIndex: Int,
+                       wrapWidth: CGFloat = 900, alignment: Int = 1, bgStyle: Int = 1) -> UIImage {
+        let font  = textStickerFontChoices[safe: fontIndex]?.uiFont ?? .systemFont(ofSize: 64, weight: .semibold)
+        let color = textStickerColorOptions[safe: colorIndex] ?? .white
+
+        let para = NSMutableParagraphStyle()
+        para.lineBreakMode = .byWordWrapping
+        para.alignment = {
+            switch alignment {
+            case 0:  return .left
+            case 2:  return .right
+            default: return .center
+            }
+        }()
+
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font, .foregroundColor: color, .paragraphStyle: para
+        ]
         let str = NSAttributedString(string: text, attributes: attrs)
         let textSize = str.boundingRect(
-            with: CGSize(width: 1200, height: 600),
+            with: CGSize(width: wrapWidth, height: 4000),
             options: [.usesLineFragmentOrigin, .usesFontLeading],
             context: nil
         ).size
-        let padding: CGFloat = 20
-        let imgSize = CGSize(width: ceil(textSize.width) + padding * 2,
-                             height: ceil(textSize.height) + padding * 2)
-        let renderer = UIGraphicsImageRenderer(size: imgSize)
-        return renderer.image { _ in str.draw(at: CGPoint(x: padding, y: padding)) }
+
+        let hPad: CGFloat = bgStyle == 1 ? 32 : 20
+        let vPad: CGFloat = bgStyle == 1 ? 20 : 10
+        let imgSize = CGSize(width:  ceil(textSize.width)  + hPad * 2,
+                             height: ceil(textSize.height) + vPad * 2)
+
+        return UIGraphicsImageRenderer(size: imgSize).image { _ in
+            if bgStyle == 1 {
+                UIColor.black.withAlphaComponent(0.72).setFill()
+                UIBezierPath(roundedRect: CGRect(origin: .zero, size: imgSize),
+                             cornerRadius: 14).fill()
+            }
+            str.draw(in: CGRect(x: hPad, y: vPad,
+                                width: ceil(textSize.width), height: ceil(textSize.height)))
+        }
     }
 }
 
-private extension Array {
+extension Array {
     subscript(safe index: Int) -> Element? {
         indices.contains(index) ? self[index] : nil
     }
@@ -103,15 +159,17 @@ struct TextStickerSheet: View {
                 ZStack {
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .fill(Color(.systemGroupedBackground))
-                    Text(text.isEmpty ? "Your text" : text)
-                        .font(Font(selectedFont.uiFont.withSize(36)))
-                        .foregroundStyle(text.isEmpty ? Color.secondary : Color(selectedUIColor))
-                        .lineLimit(2)
-                        .multilineTextAlignment(.center)
-                        .padding()
+                    ScrollView {
+                        Text(text.isEmpty ? "Your text" : text)
+                            .font(Font(selectedFont.uiFont.withSize(36)))
+                            .foregroundStyle(text.isEmpty ? Color.secondary : Color(selectedUIColor))
+                            .multilineTextAlignment(.center)
+                            .padding()
+                            .frame(maxWidth: .infinity)
+                    }
                 }
                 .frame(maxWidth: .infinity)
-                .frame(height: 110)
+                .frame(minHeight: 110, maxHeight: 200)
                 .padding(.horizontal)
                 .padding(.top, 20)
 
@@ -158,7 +216,10 @@ struct TextStickerSheet: View {
                     Button(isEditing ? "Done" : "Add") {
                         onAdd(TextStickerContent(text: text,
                                                  fontIndex: selectedFontIndex,
-                                                 colorIndex: selectedColorIndex))
+                                                 colorIndex: selectedColorIndex,
+                                                 wrapWidth: initialContent?.wrapWidth ?? 900,
+                                                 alignment: initialContent?.alignment ?? 1,
+                                                 bgStyle:   initialContent?.bgStyle   ?? 1))
                     }
                     .fontWeight(.semibold)
                     .disabled(!canConfirm)

@@ -52,12 +52,19 @@ struct StickerCanvasView: View {
     @State private var showVideoPicker  = false
     @State private var pendingVideoURL: URL? = nil
 
+    // Camera button
+    @State private var showCameraMenu    = false
+    @State private var showCameraCapture = false
+
     // Long-press menu
     @State private var selectedItem: PhotosPickerItem?
     @State private var showPlusMenu = false
     @State private var showPhotosPicker = false
-    @State private var showTextSticker = false
-    @State private var textEditTarget: TextEditTarget?
+
+    // Text editor
+    @State private var showTextEditor        = false
+    @State private var textEditorContent:    TextStickerContent? = nil
+    @State private var textEditorTargetID:   UUID?               = nil
 
     // Layers panel
     @State private var showLayersPanel = false
@@ -118,7 +125,9 @@ struct StickerCanvasView: View {
                 onTextEdit: { id in
                     if let sticker = stickers.first(where: { $0.id == id }),
                        case .text(let content) = sticker.kind {
-                        textEditTarget = TextEditTarget(id: id, content: content)
+                        textEditorContent  = content
+                        textEditorTargetID = id
+                        withAnimation { showTextEditor = true }
                     }
                 },
                 onViewReady: { view in canvasUIView = view }
@@ -141,6 +150,40 @@ struct StickerCanvasView: View {
             }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItemGroup(placement: .bottomBar) {
+                    Spacer()
+                    if !coverPickerMode && !showTrashZone {
+                        Button {
+                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+                                showCameraMenu = true
+                            }
+                        } label: {
+                            ZStack {
+                                // Rainbow glow ring
+                                Circle()
+                                    .stroke(
+                                        AngularGradient(
+                                            colors: [.red, .orange, .yellow, .green, .cyan, .blue, .purple, .pink, .red],
+                                            center: .center
+                                        ),
+                                        lineWidth: 4
+                                    )
+                                    .frame(width: 54, height: 54)
+                                    .blur(radius: 6)
+                                    .opacity(0.85)
+                                Circle()
+                                    .fill(Color.black)
+                                    .frame(width: 50, height: 50)
+                                Image(systemName: "camera.fill")
+                                    .font(.system(size: 20, weight: .semibold))
+                                    .foregroundStyle(.white)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    Spacer()
+                }
                 ToolbarItem(placement: .topBarLeading) {
                     Button {
                         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
@@ -159,7 +202,7 @@ struct StickerCanvasView: View {
                             showPlusMenu = true
                         }
                     } label: {
-                        Image(systemName: "plus")
+                        Image(systemName: "sparkle")
                             .font(.system(size: 17, weight: .semibold))
                     }
                 }
@@ -181,11 +224,15 @@ struct StickerCanvasView: View {
                         onSelect: { item in
                             showPlusMenu = false
                             switch item {
-                            case .photo:      showPhotosPicker = true
-                            case .text:       showTextSticker = true
+                            case .photo:      showPhotosPicker  = true
+                            case .text:
+                                textEditorContent  = nil
+                                textEditorTargetID = nil
+                                withAnimation { showTextEditor = true }
                             case .background: showBackgroundSheet = true
-                            case .music:      showMusicSearch = true
-                            case .video:      showVideoPicker = true
+                            case .music:      showMusicSearch   = true
+                            case .video:      showVideoPicker   = true
+                            case .camera:     showCameraCapture = true
                             }
                         },
                         onDismiss: { showPlusMenu = false }
@@ -223,6 +270,16 @@ struct StickerCanvasView: View {
                     showVideoPicker = false
                 }
             }
+            .fullScreenCover(isPresented: $showCameraCapture) {
+                CameraCapturePicker(
+                    onCapture: { image in
+                        showCameraCapture = false
+                        addStickerFromCapturedImage(image)
+                    },
+                    onCancel: { showCameraCapture = false }
+                )
+                .ignoresSafeArea()
+            }
             .sheet(item: $pendingVideoURL) { url in
                 VideoProcessingView(
                     videoURL: url,
@@ -235,6 +292,22 @@ struct StickerCanvasView: View {
                     }
                 )
             }
+            .overlay {
+                if showCameraMenu {
+                    CameraMenuOverlay(
+                        onSelect: { item in
+                            showCameraMenu = false
+                            switch item {
+                            case .photo:  showPhotosPicker  = true
+                            case .video:  showVideoPicker   = true
+                            case .camera: showCameraCapture = true
+                            default: break
+                            }
+                        },
+                        onDismiss: { showCameraMenu = false }
+                    )
+                }
+            }
             .onChange(of: selectedItem) { _, newItem in
                 guard let newItem else { return }
                 Task { await addStickerFromImage(from: newItem) }
@@ -243,39 +316,41 @@ struct StickerCanvasView: View {
                 guard let newItem else { return }
                 Task { await loadBackgroundImage(from: newItem) }
             }
-            .sheet(isPresented: $showTextSticker) {
-                TextStickerSheet(
-                    onAdd: { content in
-                        showTextSticker = false
-                        saveUndoState()
-                        topZ += 1
-                        let sticker = Sticker(
-                            kind: .text(content),
-                            position: visibleCenter(),
-                            scale: 1.0,
-                            rotation: .zero,
-                            zIndex: topZ
-                        )
-                        stickers.append(sticker)
-                        selectedStickerID = sticker.id
-                    },
-                    onCancel: { showTextSticker = false }
-                )
-                .presentationDetents([.medium, .large])
-            }
-            .sheet(item: $textEditTarget) { target in
-                TextStickerSheet(
-                    initialContent: target.content,
-                    onAdd: { newContent in
-                        if let idx = stickers.firstIndex(where: { $0.id == target.id }) {
-                            saveUndoState()
-                            stickers[idx].kind = .text(newContent)
+            .overlay {
+                if showTextEditor {
+                    TextEditorOverlay(
+                        initialContent: textEditorContent,
+                        onComplete: { content in
+                            withAnimation { showTextEditor = false }
+                            if let targetID = textEditorTargetID,
+                               let idx = stickers.firstIndex(where: { $0.id == targetID }) {
+                                saveUndoState()
+                                stickers[idx].kind = .text(content)
+                                canvasUIView?.invalidateStickerCache()
+                            } else {
+                                saveUndoState()
+                                topZ += 1
+                                let sticker = Sticker(
+                                    kind: .text(content),
+                                    position: visibleCenter(),
+                                    scale: 1.0,
+                                    rotation: .zero,
+                                    zIndex: topZ
+                                )
+                                stickers.append(sticker)
+                                selectedStickerID = sticker.id
+                            }
+                            textEditorContent  = nil
+                            textEditorTargetID = nil
+                        },
+                        onCancel: {
+                            withAnimation { showTextEditor = false }
+                            textEditorContent  = nil
+                            textEditorTargetID = nil
                         }
-                        textEditTarget = nil
-                    },
-                    onCancel: { textEditTarget = nil }
-                )
-                .presentationDetents([.medium, .large])
+                    )
+                    .transition(.opacity)
+                }
             }
             .sheet(isPresented: $showBackgroundSheet) {
                 backgroundSheet
@@ -318,7 +393,11 @@ struct StickerCanvasView: View {
                 }
             case "text":
                 if let text = s.textString, let fi = s.fontIndex, let ci = s.colorIndex {
-                    let content = TextStickerContent(text: text, fontIndex: fi, colorIndex: ci)
+                    let wrapWidth = s.textWrapWidth.map { CGFloat($0) } ?? 900
+                    let alignment = s.textAlignment ?? 1
+                    let bgStyle   = s.textBGStyle   ?? 1
+                    let content = TextStickerContent(text: text, fontIndex: fi, colorIndex: ci,
+                                                     wrapWidth: wrapWidth, alignment: alignment, bgStyle: bgStyle)
                     loaded.append(Sticker(id: s.id, kind: .text(content), position: pos, scale: s.scale, rotation: rot, zIndex: s.zIndex))
                 }
             case "music":
@@ -377,10 +456,13 @@ struct StickerCanvasView: View {
                         s.imageFilename = fn
                     }
                 case .text(let content):
-                    s.type = "text"
-                    s.textString = content.text
-                    s.fontIndex   = content.fontIndex
-                    s.colorIndex  = content.colorIndex
+                    s.type          = "text"
+                    s.textString    = content.text
+                    s.fontIndex     = content.fontIndex
+                    s.colorIndex    = content.colorIndex
+                    s.textWrapWidth = Double(content.wrapWidth)
+                    s.textAlignment = content.alignment
+                    s.textBGStyle   = content.bgStyle
                 case .music(let track):
                     s.type = "music"
                     s.musicID               = track.id
@@ -582,18 +664,23 @@ struct StickerCanvasView: View {
                 VStack {
                     Spacer()
                     Button {
-                        guard let tid = tapestryID else { return }
-                        // Convert frameRect to UIKit screen coordinates using the
-                        // GeometryReader's global origin, so the capture region exactly
-                        // matches the visible frame regardless of safe-area offsets.
-                        let geoOrigin = geo.frame(in: .global).origin
+                        guard let tid = tapestryID, let cv = canvasUIView else {
+                            onCoverCancelled?()
+                            return
+                        }
+                        // Compute capture rect in canvasUIView's own coordinate space
+                        let ar = coverFrameAspectRatio
+                        let capW = min(cv.bounds.width, cv.bounds.height * ar)
+                        let capH = capW / ar
                         let captureRect = CGRect(
-                            x: geoOrigin.x + xInset,
-                            y: geoOrigin.y + yInset,
-                            width: frameW,
-                            height: frameH
+                            x: (cv.bounds.width  - capW) / 2,
+                            y: (cv.bounds.height - capH) / 2,
+                            width: capW, height: capH
                         )
-                        guard let img = canvasUIView?.renderViewportThumbnail(in: captureRect) else { return }
+                        guard let img = cv.renderViewportThumbnail(in: captureRect) else {
+                            onCoverCancelled?()
+                            return
+                        }
                         if let filename = store.saveThumbnail(img, for: tid) {
                             store.updateThumbnailFilename(tapestryID: tid, filename: filename)
                         }
@@ -689,6 +776,22 @@ extension StickerCanvasView {
         selectedItem = nil
     }
 
+    private func addStickerFromCapturedImage(_ image: UIImage) {
+        let normalized = image.normalized()
+        saveUndoState()
+        topZ += 1
+        let sticker = Sticker(
+            id: UUID(),
+            kind: .photo(normalized),
+            position: visibleCenter(),
+            scale: 1.0,
+            rotation: .zero,
+            zIndex: topZ
+        )
+        stickers.append(sticker)
+        selectedStickerID = sticker.id
+    }
+
     private func addVideoSticker(result: VideoProcessor.Result) {
         saveUndoState()
         topZ += 1
@@ -773,13 +876,6 @@ extension StickerCanvasView {
             y: canvasSize / 2 - canvasOffset.height / safeScale
         )
     }
-}
-
-// MARK: - Text Edit Target
-
-private struct TextEditTarget: Identifiable {
-    let id: UUID                 // sticker ID
-    let content: TextStickerContent
 }
 
 // MARK: - Undo Model
@@ -1182,9 +1278,24 @@ final class CanvasUIView: UIView {
     private var lastSyncedStickers:  [Sticker]? = nil
     private var lastSyncedSelection: UUID?       = nil
 
+    func invalidateStickerCache() {
+        lastSyncedStickers = nil
+    }
+
     func syncStickersIfNeeded(stickers: [Sticker], selectedID: UUID?) {
         // Skip if nothing changed — e.g. pure pan/pinch updates
-        let stickersSame  = lastSyncedStickers.map { $0.elementsEqual(stickers, by: { $0.id == $1.id && $0.position == $1.position && $0.scale == $1.scale && $0.rotation == $1.rotation && $0.zIndex == $1.zIndex }) } ?? false
+        let stickersSame  = lastSyncedStickers.map { $0.elementsEqual(stickers, by: { a, b in
+            guard a.id == b.id && a.position == b.position &&
+                  a.scale == b.scale && a.rotation == b.rotation && a.zIndex == b.zIndex
+            else { return false }
+            // Also detect text content changes (e.g. wrapWidth, font, color)
+            if case .text(let ta) = a.kind, case .text(let tb) = b.kind {
+                return ta.text == tb.text && ta.fontIndex == tb.fontIndex &&
+                       ta.colorIndex == tb.colorIndex && ta.wrapWidth == tb.wrapWidth &&
+                       ta.alignment == tb.alignment && ta.bgStyle == tb.bgStyle
+            }
+            return true
+        }) } ?? false
         let selectionSame = lastSyncedSelection == selectedID
         guard !stickersSame || !selectionSame else { return }
         lastSyncedStickers  = stickers
@@ -1273,7 +1384,8 @@ final class CanvasUIView: UIView {
                     sc.onGestureEnd = gestureEnd
                     sc.onDragChanged = { [weak coordinator] p in coordinator?.onDragChanged?(p) }
                     sc.onDragEnded   = { [weak coordinator] p in coordinator?.onDragEnded?(p, sid) }
-                    sc.onLongPress   = { [weak coordinator] in
+                    // Double-tap opens the text editor; long press is left free so dragging isn't blocked
+                    sc.onDoubleTap   = { [weak coordinator] in
                         DispatchQueue.main.async { coordinator?.onTextEdit?(sid) }
                     }
                     let sv = StickerUIView(coordinator: sc)

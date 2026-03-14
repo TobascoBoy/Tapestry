@@ -30,6 +30,11 @@ struct Swift_test_2App: App {
                 }
             }
             .preferredColorScheme(preferredColorScheme)
+            .onAppear {
+                DispatchQueue.global(qos: .utility).async {
+                    _ = NatureSegmentationProcessor.shared
+                }
+            }
             .onChange(of: auth.isSignedIn) { _, signedIn in
                 if signedIn {
                     tapestryStore.currentUserID = auth.userID

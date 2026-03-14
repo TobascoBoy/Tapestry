@@ -1,5 +1,7 @@
 import Foundation
 import Supabase
+import AuthenticationServices
+import CryptoKit
 
 // MARK: - AuthManager
 
@@ -38,5 +40,45 @@ final class AuthManager {
     func signOut() async throws {
         try await supabase.auth.signOut()
         session = nil
+    }
+
+    // MARK: - Sign in with Apple
+
+    private(set) var appleSignInNonce: String?
+
+    func randomNonce(length: Int = 32) -> String {
+        var bytes = [UInt8](repeating: 0, count: length)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    func sha256(_ input: String) -> String {
+        let data = Data(input.utf8)
+        let hash = SHA256.hash(data: data)
+        return hash.compactMap { String(format: "%02x", $0) }.joined()
+    }
+
+    @MainActor
+    func prepareAppleSignIn() -> String {
+        let nonce = randomNonce()
+        appleSignInNonce = nonce
+        return sha256(nonce)
+    }
+
+    @MainActor
+    func handleAppleSignIn(credential: ASAuthorizationAppleIDCredential) async throws {
+        guard let nonce = appleSignInNonce,
+              let tokenData = credential.identityToken,
+              let idToken = String(data: tokenData, encoding: .utf8) else {
+            throw AuthError.missingCredentials
+        }
+        try await supabase.auth.signInWithIdToken(
+            credentials: .init(provider: .apple, idToken: idToken, nonce: nonce)
+        )
+    }
+
+    enum AuthError: LocalizedError {
+        case missingCredentials
+        var errorDescription: String? { "Sign in with Apple failed. Please try again." }
     }
 }
