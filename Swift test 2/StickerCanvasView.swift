@@ -23,6 +23,7 @@ struct StickerCanvasView: View {
     var initialCanvasData: String? = nil
     var canvasMode: CanvasMode = .infinite
     var coverPickerMode: Bool = false
+    var coverFrameAspectRatio: CGFloat = 1.0   // width / height of target cover shape
     var onCoverPicked: ((UIImage) -> Void)? = nil
     var onCoverCancelled: (() -> Void)? = nil
 
@@ -37,7 +38,7 @@ struct StickerCanvasView: View {
     // Background
     @State private var canvasBackground: CanvasBackground = .color(.white)
     @State private var showBackgroundSheet = false
-    @State private var bgPickerItem: PhotosPickerItem?  // still used for background only
+    @State private var bgPickerItem: PhotosPickerItem?  // background photo picker only
     @State private var selectedColor: Color = .white
 
     // Trash zone
@@ -282,7 +283,6 @@ struct StickerCanvasView: View {
             .onAppear  { DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { loadCanvas() } }
             .onDisappear {
                 saveCanvas()
-                autoSaveThumbnail()
             }
     }
 
@@ -428,13 +428,6 @@ struct StickerCanvasView: View {
         }
     }
 
-    private func autoSaveThumbnail() {
-        guard let tid = tapestryID, !coverPickerMode,
-              let img = canvasUIView?.renderViewportThumbnail() else { return }
-        if let filename = store.saveThumbnail(img, for: tid) {
-            store.updateThumbnailFilename(tapestryID: tid, filename: filename)
-        }
-    }
 
     // MARK: - Background Sheet
 
@@ -539,57 +532,129 @@ struct StickerCanvasView: View {
     // MARK: - Cover Picker Overlay
 
     private var coverPickerOverlay: some View {
-        VStack(spacing: 0) {
-            // Top banner — taps here are consumed; canvas underneath remains interactive
-            HStack {
-                Button { onCoverCancelled?() } label: {
-                    Image(systemName: "xmark")
+        // No .ignoresSafeArea() on the GeometryReader — geo.size must match CanvasUIView.bounds
+        GeometryReader { geo in
+            let ar     = coverFrameAspectRatio
+            let frameW = min(geo.size.width, geo.size.height * ar)
+            let frameH = frameW / ar
+            let xInset = (geo.size.width  - frameW) / 2
+            let yInset = (geo.size.height - frameH) / 2
+            let frameRect = CGRect(x: xInset, y: yInset, width: frameW, height: frameH)
+
+            ZStack(alignment: .top) {
+                // ── Dimmed surround with cutout ──────────────────────────────
+                CoverFrameMask(frameRect: frameRect, size: geo.size)
+                    .fill(.black.opacity(0.45), style: FillStyle(eoFill: true))
+                    .allowsHitTesting(false)
+
+                // ── Frame border ─────────────────────────────────────────────
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(.white.opacity(0.85), lineWidth: 2)
+                    .frame(width: frameW, height: frameH)
+                    .position(x: geo.size.width / 2, y: geo.size.height / 2)
+                    .allowsHitTesting(false)
+
+                // ── Corner ticks ─────────────────────────────────────────────
+                CornerTicks(rect: frameRect)
+                    .stroke(.white, lineWidth: 3)
+                    .allowsHitTesting(false)
+
+                // ── Top banner ───────────────────────────────────────────────
+                HStack {
+                    Button { onCoverCancelled?() } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .frame(width: 44, height: 44)
+                    }
+                    Spacer()
+                    Text("Frame your cover")
                         .font(.system(size: 16, weight: .semibold))
                         .foregroundStyle(.white)
-                        .frame(width: 44, height: 44)
+                    Spacer()
+                    Color.clear.frame(width: 44, height: 44)
                 }
-                Spacer()
-                Text("Frame your cover")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(.white)
-                Spacer()
-                // Invisible balance spacer so title stays centred
-                Color.clear.frame(width: 44, height: 44)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 10)
-            .background(.ultraThinMaterial.opacity(0.85))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 10)
+                .background(.ultraThinMaterial.opacity(0.85))
 
-            // Middle — let all touches fall through to the canvas
-            Spacer()
-                .allowsHitTesting(false)
-
-            // Bottom — checkmark confirm
-            Button {
-                guard let tid = tapestryID,
-                      let img = canvasUIView?.renderViewportThumbnail() else { return }
-                // Save directly from within the canvas — store is in scope via @Environment
-                if let filename = store.saveThumbnail(img, for: tid) {
-                    store.updateThumbnailFilename(tapestryID: tid, filename: filename)
-                }
-                onCoverPicked?(img)   // signal parent to dismiss
-            } label: {
-                ZStack {
-                    Circle()
-                        .fill(Color.white)
-                        .frame(width: 64, height: 64)
-                        .shadow(color: .black.opacity(0.25), radius: 10, y: 4)
-                    Image(systemName: "checkmark")
-                        .font(.system(size: 26, weight: .bold))
-                        .foregroundStyle(.black)
+                // ── Checkmark confirm ────────────────────────────────────────
+                VStack {
+                    Spacer()
+                    Button {
+                        guard let tid = tapestryID else { return }
+                        // Convert frameRect to UIKit screen coordinates using the
+                        // GeometryReader's global origin, so the capture region exactly
+                        // matches the visible frame regardless of safe-area offsets.
+                        let geoOrigin = geo.frame(in: .global).origin
+                        let captureRect = CGRect(
+                            x: geoOrigin.x + xInset,
+                            y: geoOrigin.y + yInset,
+                            width: frameW,
+                            height: frameH
+                        )
+                        guard let img = canvasUIView?.renderViewportThumbnail(in: captureRect) else { return }
+                        if let filename = store.saveThumbnail(img, for: tid) {
+                            store.updateThumbnailFilename(tapestryID: tid, filename: filename)
+                        }
+                        onCoverPicked?(img)
+                    } label: {
+                        ZStack {
+                            Circle()
+                                .fill(Color.white)
+                                .frame(width: 64, height: 64)
+                                .shadow(color: .black.opacity(0.25), radius: 10, y: 4)
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 26, weight: .bold))
+                                .foregroundStyle(.black)
+                        }
+                    }
+                    .padding(.bottom, 52)
+                    .padding(.top, 20)
                 }
             }
-            .padding(.bottom, 52)
-            .padding(.top, 20)
         }
-        .ignoresSafeArea()
     }
 
+}
+
+// ── Cover picker helper shapes ────────────────────────────────────────────────
+
+/// Fills the full rect minus a square hole — creates the dimmed surround effect.
+private struct CoverFrameMask: Shape {
+    let frameRect: CGRect
+    let size: CGSize
+
+    func path(in _: CGRect) -> Path {
+        var p = Path(CGRect(origin: .zero, size: size))
+        p.addRoundedRect(in: frameRect, cornerRadii: .init(topLeading: 16, bottomLeading: 16, bottomTrailing: 16, topTrailing: 16))
+        return p
+    }
+}
+
+/// Draws short L-shaped ticks at the four corners of the capture frame.
+private struct CornerTicks: Shape {
+    let rect: CGRect
+    let tickLen: CGFloat = 20
+
+    func path(in _: CGRect) -> Path {
+        var p = Path()
+        let corners: [(CGPoint, CGFloat, CGFloat)] = [
+            (rect.origin,                           1,  1),
+            (CGPoint(x: rect.maxX, y: rect.minY), -1,  1),
+            (CGPoint(x: rect.minX, y: rect.maxY),  1, -1),
+            (CGPoint(x: rect.maxX, y: rect.maxY), -1, -1),
+        ]
+        for (pt, dx, dy) in corners {
+            p.move(to: CGPoint(x: pt.x + dx * tickLen, y: pt.y))
+            p.addLine(to: pt)
+            p.addLine(to: CGPoint(x: pt.x, y: pt.y + dy * tickLen))
+        }
+        return p
+    }
+}
+
+extension StickerCanvasView {
     // MARK: - Sticker Management
 
     @MainActor
@@ -599,7 +664,7 @@ struct StickerCanvasView: View {
         let stickerID = UUID()
         let uiImage: UIImage
 
-        if data.isAnimatedGIF, let animated = UIImage.animatedGIF(from: data) {
+        if data.isGIF, let animated = UIImage.animatedGIF(from: data) {
             uiImage = animated
             // Persist raw GIF bytes immediately so saveCanvas can reference them by ID
             let fn = "\(stickerID.uuidString).gif"
@@ -829,18 +894,38 @@ struct CanvasHostView: UIViewRepresentable {
 
 final class CanvasUIView: UIView {
 
-    /// Renders the currently visible viewport (what the user sees) to a square UIImage.
-    /// Used for the "Edit Cover" screenshot capture.
-    func renderViewportThumbnail() -> UIImage? {
-        // Hide the grid for a clean capture
+    /// Renders an explicit screen-coordinate rect of the canvas layer to a UIImage.
+    /// The captureRect should be in the same coordinate space as the UIView (screen coordinates
+    /// starting at 0,0 at the top of the screen). Used by the cover picker overlay.
+    func renderViewportThumbnail(in captureRect: CGRect) -> UIImage? {
         let gridWasHidden = gridLayer.isHidden
         gridLayer.isHidden = true
 
-        let side = min(bounds.width, bounds.height)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = UIScreen.main.scale
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: captureRect.size, format: format)
+        let image = renderer.image { ctx in
+            ctx.cgContext.translateBy(x: -captureRect.origin.x, y: -captureRect.origin.y)
+            layer.render(in: ctx.cgContext)
+        }
+
+        gridLayer.isHidden = gridWasHidden
+        return image
+    }
+
+    /// Renders the currently visible viewport to a UIImage at the given aspect ratio (width/height).
+    /// Used for the "Edit Cover" screenshot capture.
+    func renderViewportThumbnail(aspectRatio: CGFloat = 1.0) -> UIImage? {
+        let gridWasHidden = gridLayer.isHidden
+        gridLayer.isHidden = true
+
+        let captureW = min(bounds.width, bounds.height * aspectRatio)
+        let captureH = captureW / aspectRatio
         let captureRect = CGRect(
-            x: (bounds.width  - side) / 2,
-            y: (bounds.height - side) / 2,
-            width: side, height: side
+            x: (bounds.width  - captureW) / 2,
+            y: (bounds.height - captureH) / 2,
+            width: captureW, height: captureH
         )
         let format = UIGraphicsImageRendererFormat()
         format.scale = UIScreen.main.scale
@@ -855,27 +940,6 @@ final class CanvasUIView: UIView {
         return image
     }
 
-    /// Renders the full canvas content to a square thumbnail (window into the tapestry).
-    func renderThumbnail(size: CGFloat = 600) -> UIImage? {
-        let targetSize = CGSize(width: size, height: size)
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = 2.0   // 1200px output — crisp on all devices, renders ~3× faster than 3×
-        format.opaque = true
-        let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
-
-        // Temporarily hide grid and deselect visually
-        let gridWasHidden = gridLayer.isHidden
-        gridLayer.isHidden = true
-
-        let image = renderer.image { ctx in
-            let s = targetSize.width / canvasView.bounds.width
-            ctx.cgContext.scaleBy(x: s, y: s)
-            canvasView.layer.render(in: ctx.cgContext)
-        }
-
-        gridLayer.isHidden = gridWasHidden
-        return image
-    }
     private weak var coordinator: CanvasCoordinator?
 
     let canvasView = UIView()
@@ -1013,6 +1077,11 @@ final class CanvasUIView: UIView {
         guard lassoOverlay == nil else { return }
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
 
+        // Set the flag FIRST — sticker gesture cancellations triggered by the double-tap
+        // recognizer will call gestureEnd, which re-enables canvasPan/canvasPinch unless
+        // this flag is already set.
+        coordinator?.isLassoActive = true
+
         // Freeze canvas gestures while lasso is active
         coordinator?.canvasPan?.isEnabled   = false
         coordinator?.canvasPinch?.isEnabled = false
@@ -1031,6 +1100,7 @@ final class CanvasUIView: UIView {
                 overlay.removeFromSuperview()
             }
             self.lassoOverlay = nil
+            self.coordinator?.isLassoActive     = false
             self.coordinator?.canvasPan?.isEnabled   = true
             self.coordinator?.canvasPinch?.isEnabled = true
             self.applyLasso(points: points, stickerID: stickerID)
@@ -1040,6 +1110,7 @@ final class CanvasUIView: UIView {
                 overlay.removeFromSuperview()
             }
             self?.lassoOverlay = nil
+            self?.coordinator?.isLassoActive     = false
             self?.coordinator?.canvasPan?.isEnabled   = true
             self?.coordinator?.canvasPinch?.isEnabled = true
         }
@@ -1150,6 +1221,7 @@ final class CanvasUIView: UIView {
             coordinator?.canvasPinch?.isEnabled = false
         }
         let gestureEnd: () -> Void = { [weak coordinator] in
+            guard coordinator?.isLassoActive != true else { return }
             coordinator?.canvasPan?.isEnabled = true
             coordinator?.canvasPinch?.isEnabled = true
         }
@@ -1401,6 +1473,7 @@ final class CanvasCoordinator: NSObject, UIGestureRecognizerDelegate {
     weak var canvasView: UIView?
     weak var canvasPan: UIPanGestureRecognizer?
     weak var canvasPinch: UIPinchGestureRecognizer?
+    var isLassoActive: Bool = false
 
     private var panStartOffset: CGSize = .zero
     private var pinchStartScale: CGFloat = 1.0

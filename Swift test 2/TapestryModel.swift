@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import SwiftUI
 import UIKit
 import Supabase
 
@@ -9,6 +10,35 @@ enum TapestryType: String, Codable, Identifiable {
     case personal
     case group
     var id: Self { self }
+}
+
+enum CoverShape: String, Codable {
+    case square, wide, tall
+
+    /// Cycles to the next shape in order.
+    var next: CoverShape {
+        switch self {
+        case .square: return .wide
+        case .wide:   return .tall
+        case .tall:   return .square
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .square: return "square"
+        case .wide:   return "rectangle"
+        case .tall:   return "rectangle.portrait"
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .square: return "Square"
+        case .wide:   return "Wide"
+        case .tall:   return "Tall"
+        }
+    }
 }
 
 // MARK: - Tapestry Model
@@ -119,21 +149,19 @@ private struct TapestryRow: Decodable {
 @Observable
 final class TapestryStore {
     private(set) var tapestries: [Tapestry] = []
-    var debugMessage: String = ""   // visible error surfacing for diagnosis
 
-    var personal: [Tapestry] { tapestries.filter { $0.type == .personal } }
-    var group: [Tapestry]    { tapestries.filter { $0.type == .group } }
+    // User-defined display order (local, not synced to Supabase)
+    private(set) var tapestryOrder: [UUID] = []
 
     // Set when user signs in so add/delete can attach owner_id
     var currentUserID: UUID?
 
-    private static let thumbDir    = "tapestry-thumbs"
-    private static let thumbsKey   = "tapestry_thumbnail_filenames"  // UserDefaults key
+    private static let thumbDir  = "tapestry-thumbs"
+    private static let thumbsKey = "tapestry_thumbnail_filenames"
+    private static let orderKey  = "tapestry_display_order"
 
     // Thumbnail cache — observable so writes immediately re-render any subscribed view
     private var thumbnailCache: [UUID: UIImage] = [:]
-    // Viewport cache — not observed (only read during profile re-renders, not used currently)
-    @ObservationIgnored private var viewportCache:  [UUID: (offset: CGSize, scale: CGFloat)] = [:]
 
     // Persisted map of tapestryID → thumbnail filename
     private var savedThumbnailMap: [String: String] {
@@ -147,16 +175,54 @@ final class TapestryStore {
             .appendingPathComponent(Self.thumbDir)
     }
 
-    init() {}
+    init() { loadDisplayOrder() }
+
+    // MARK: - Display Order
+
+    private func loadDisplayOrder() {
+        tapestryOrder = (UserDefaults.standard.stringArray(forKey: Self.orderKey) ?? [])
+            .compactMap(UUID.init)
+    }
+
+    private func saveDisplayOrder() {
+        UserDefaults.standard.set(tapestryOrder.map(\.uuidString), forKey: Self.orderKey)
+    }
+
+    /// Returns unpinned tapestries in the user's custom display order.
+    /// Tapestries not yet in the order (newly added from another device) appear first.
+    func orderedUnpinnedTapestries(excludingPinnedID pinnedID: UUID?) -> [Tapestry] {
+        let base = tapestries.filter { $0.id != pinnedID }
+        var placed = Set<UUID>()
+        var ordered: [Tapestry] = []
+        for id in tapestryOrder {
+            if let t = base.first(where: { $0.id == id }) {
+                ordered.append(t)
+                placed.insert(id)
+            }
+        }
+        // Prepend any not yet in the order (new items)
+        let unordered = base.filter { !placed.contains($0.id) }
+        return unordered + ordered
+    }
+
+    /// Moves a tapestry within the display order.
+    func moveTapestry(fromOffsets: IndexSet, toOffset: Int, excludingPinnedID pinnedID: UUID?) {
+        var ordered = orderedUnpinnedTapestries(excludingPinnedID: pinnedID)
+        ordered.move(fromOffsets: fromOffsets, toOffset: toOffset)
+        tapestryOrder = ordered.map(\.id)
+        saveDisplayOrder()
+    }
+
+    /// Replaces the display order with the given already-ordered unpinned tapestries.
+    func setDisplayOrder(to ordered: [Tapestry]) {
+        tapestryOrder = ordered.map(\.id)
+        saveDisplayOrder()
+    }
 
     // MARK: - Fetch from Supabase
 
     func fetch() async {
-        guard let uid = currentUserID else {
-            await MainActor.run { debugMessage = "FETCH: no currentUserID" }
-            return
-        }
-        await MainActor.run { debugMessage = "Fetching for \(uid.uuidString.prefix(8))…" }
+        guard let uid = currentUserID else { return }
         do {
             let rows: [TapestryRow] = try await supabase
                 .from("tapestries")
@@ -173,10 +239,12 @@ final class TapestryStore {
                     t.thumbnailFilename = thumbMap[row.id.uuidString]
                     return t
                 }
-                debugMessage = "Fetched \(rows.count) tapestries ✓"
+                // Reconcile order: add new IDs, drop deleted IDs
+                let activeIDs = Set(tapestries.map(\.id))
+                tapestryOrder = tapestryOrder.filter { activeIDs.contains($0) }
+                saveDisplayOrder()
             }
         } catch {
-            await MainActor.run { debugMessage = "FETCH ERROR: \(error)" }
             print("TapestryStore.fetch error: \(error)")
         }
     }
@@ -184,7 +252,9 @@ final class TapestryStore {
     // MARK: - CRUD
 
     func add(_ tapestry: Tapestry) {
-        tapestries.insert(tapestry, at: 0)   // optimistic local update — newest first
+        tapestries.insert(tapestry, at: 0)
+        tapestryOrder.insert(tapestry.id, at: 0)  // keep new item at the front
+        saveDisplayOrder()
         guard let uid = currentUserID else { return }
         Task {
             do {
@@ -199,7 +269,6 @@ final class TapestryStore {
                     ))
                     .execute()
             } catch {
-                await MainActor.run { debugMessage = "INSERT ERROR: \(error)" }
                 print("TapestryStore.add error: \(error)")
             }
         }
@@ -237,8 +306,9 @@ final class TapestryStore {
 
     func delete(_ tapestry: Tapestry) {
         tapestries.removeAll { $0.id == tapestry.id }
+        tapestryOrder.removeAll { $0 == tapestry.id }
+        saveDisplayOrder()
         thumbnailCache.removeValue(forKey: tapestry.id)
-        viewportCache.removeValue(forKey: tapestry.id)
         // Remove local thumbnail
         if let fn = tapestry.thumbnailFilename {
             try? FileManager.default.removeItem(at: thumbsDir.appendingPathComponent(fn))
@@ -319,43 +389,34 @@ final class TapestryStore {
         }
     }
 
-    // MARK: - Viewport adjustments (how the thumbnail is framed in the bubble)
+    // MARK: - Cover Shape (local, per-tapestry grid cell)
 
-    private static let viewportsKey = "tapestry_viewports"
+    private static let coverShapesKey = "tapestry_cover_shapes"
+    // Not @ObservationIgnored so mutations trigger SwiftUI re-renders.
+    private var coverShapeCache: [UUID: CoverShape] = [:]
 
-    private struct ViewportRecord: Codable {
-        var offsetX: Double
-        var offsetY: Double
-        var scale:   Double
+    func coverShape(for tapestryID: UUID) -> CoverShape {
+        if let cached = coverShapeCache[tapestryID] { return cached }
+        guard let data  = UserDefaults.standard.data(forKey: Self.coverShapesKey),
+              let map   = try? JSONDecoder().decode([String: String].self, from: data),
+              let raw   = map[tapestryID.uuidString],
+              let shape = CoverShape(rawValue: raw)
+        else { return .square }
+        coverShapeCache[tapestryID] = shape
+        return shape
     }
 
-    func viewport(for tapestryID: UUID) -> (offset: CGSize, scale: CGFloat) {
-        // Serve from memory — avoids UserDefaults + JSON decode on every render
-        if let cached = viewportCache[tapestryID] { return cached }
-        guard let data = UserDefaults.standard.data(forKey: Self.viewportsKey),
-              let map  = try? JSONDecoder().decode([String: ViewportRecord].self, from: data),
-              let v    = map[tapestryID.uuidString] else {
-            return (.zero, 1.0)
-        }
-        let result = (CGSize(width: v.offsetX, height: v.offsetY), CGFloat(v.scale))
-        viewportCache[tapestryID] = result
-        return result
-    }
-
-    func setViewport(tapestryID: UUID, offset: CGSize, scale: CGFloat) {
-        viewportCache[tapestryID] = (offset, scale)   // update memory cache immediately
-        var map: [String: ViewportRecord] = [:]
-        if let data = UserDefaults.standard.data(forKey: Self.viewportsKey),
-           let existing = try? JSONDecoder().decode([String: ViewportRecord].self, from: data) {
+    func setCoverShape(tapestryID: UUID, shape: CoverShape) {
+        coverShapeCache[tapestryID] = shape
+        var map: [String: String] = [:]
+        if let data = UserDefaults.standard.data(forKey: Self.coverShapesKey),
+           let existing = try? JSONDecoder().decode([String: String].self, from: data) {
             map = existing
         }
-        map[tapestryID.uuidString] = ViewportRecord(
-            offsetX: Double(offset.width),
-            offsetY: Double(offset.height),
-            scale:   Double(scale)
-        )
+        map[tapestryID.uuidString] = shape.rawValue
         if let data = try? JSONEncoder().encode(map) {
-            UserDefaults.standard.set(data, forKey: Self.viewportsKey)
+            UserDefaults.standard.set(data, forKey: Self.coverShapesKey)
         }
     }
+
 }

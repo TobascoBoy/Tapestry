@@ -143,7 +143,8 @@ extension UIImage {
 
 extension Data {
     /// Returns true when the bytes start with the GIF magic number ("GIF87a" or "GIF89a").
-    var isAnimatedGIF: Bool {
-        count >= 4 && self[0] == 0x47 && self[1] == 0x49 && self[2] == 0x46  // "GIF"
+    /// Whether the GIF is animated is determined downstream by checking frame count.
+    var isGIF: Bool {
+        count >= 3 && self[0] == 0x47 && self[1] == 0x49 && self[2] == 0x46  // "GIF"
     }
 }

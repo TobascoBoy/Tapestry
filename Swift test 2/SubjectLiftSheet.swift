@@ -181,13 +181,13 @@ final class SubjectLiftCoordinator: NSObject, ImageAnalysisInteractionDelegate {
         guard let imageView, let image = imageView.image else {
             return imageView?.bounds ?? .zero
         }
-        return AVMakeRect(aspectRatio: image.size, insideRect: imageView.bounds)
+        return makeAspectFitRect(aspectRatio: image.size, insideRect: imageView.bounds)
     }
 }
 
-// MARK: - CGRect aspect-fit helper (mirrors AVFoundation's AVMakeRect without the import)
+// MARK: - CGRect aspect-fit helper
 
-private func AVMakeRect(aspectRatio: CGSize, insideRect boundingRect: CGRect) -> CGRect {
+private func makeAspectFitRect(aspectRatio: CGSize, insideRect boundingRect: CGRect) -> CGRect {
     let widthRatio  = boundingRect.width  / aspectRatio.width
     let heightRatio = boundingRect.height / aspectRatio.height
     let scale = min(widthRatio, heightRatio)
