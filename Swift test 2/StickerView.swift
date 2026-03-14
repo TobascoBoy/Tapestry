@@ -112,8 +112,58 @@ final class StickerCoordinator: NSObject, UIGestureRecognizerDelegate {
         if let onLongPress {
             onLongPress()
         } else {
-            Task { await removeBackground() }
+            let touchPoint = gr.location(in: gr.view)
+            Task { await smartRemoveBackground(touchPoint: touchPoint, on: gr.view) }
         }
+    }
+
+    /// Tries nature segmentation at the touch point first; falls back to Vision foreground mask.
+    @MainActor
+    private func smartRemoveBackground(touchPoint: CGPoint, on view: UIView?) async {
+        guard case .photo(let currentImage) = sticker.wrappedValue.kind else { return }
+
+        // Show spinner so the user knows processing is happening
+        let spinner = UIActivityIndicatorView(style: .medium)
+        spinner.color = .white
+        spinner.center = CGPoint(x: 0, y: 0)
+        view?.addSubview(spinner)
+        spinner.startAnimating()
+        defer {
+            spinner.stopAnimating()
+            spinner.removeFromSuperview()
+        }
+
+        let source = currentImage.normalized()
+        let imagePoint = viewPointToImagePoint(touchPoint, image: source)
+
+        if let natureResult = await NatureSegmentationProcessor.shared.extractNature(
+            from: source, at: imagePoint
+        ) {
+            sticker.wrappedValue.kind = .photo(natureResult)
+            return
+        }
+
+        await removeBackground()
+    }
+
+    /// Converts a point in StickerUIView coordinate space (origin at center, ±110pt)
+    /// to pixel coordinates in the given image.
+    private func viewPointToImagePoint(_ point: CGPoint, image: UIImage) -> CGPoint {
+        guard let cg = image.cgImage else { return point }
+        let viewSize = CGSize(width: 220, height: 220)
+        let imgSize  = CGSize(width: cg.width, height: cg.height)
+        let scale    = min(viewSize.width / imgSize.width, viewSize.height / imgSize.height)
+        let drawSize = CGSize(width: imgSize.width * scale, height: imgSize.height * scale)
+        let drawOrigin = CGPoint(
+            x: (viewSize.width  - drawSize.width)  / 2,
+            y: (viewSize.height - drawSize.height) / 2
+        )
+        // StickerUIView bounds origin is (-110, -110), so shift to 0-based space
+        let local = CGPoint(x: point.x + 110, y: point.y + 110)
+        return CGPoint(
+            x: (local.x - drawOrigin.x) / scale,
+            y: (local.y - drawOrigin.y) / scale
+        )
     }
 
     @MainActor
