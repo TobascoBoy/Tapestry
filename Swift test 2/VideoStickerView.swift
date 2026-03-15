@@ -1,6 +1,5 @@
 import UIKit
 import AVFoundation
-import CoreMedia
 
 // MARK: - VideoStickerUIView
 
@@ -13,10 +12,8 @@ final class VideoStickerUIView: UIView {
     private let thumbnailView = UIImageView()
     private var playerLayer:  AVPlayerLayer?
 
-    // For bg-removed video: AVSampleBufferDisplayLayer for true alpha support
-    private var sampleLayer:  AVSampleBufferDisplayLayer?
-    private var videoOutput:  AVPlayerItemVideoOutput?
-    private var displayLink:  CADisplayLink?
+    // For bg-removed video: a second AVPlayerLayer with backgroundColor = nil
+    private var alphaPlayerLayer: AVPlayerLayer?
 
     private var player:       AVPlayer?
     private var playerLooper: AVPlayerLooper?
@@ -139,87 +136,27 @@ final class VideoStickerUIView: UIView {
     }
 
     private func buildAlphaPlayer(url: URL) {
-        // AVSampleBufferDisplayLayer for true HEVC-alpha transparency
-        let sl          = AVSampleBufferDisplayLayer()
-        sl.videoGravity = .resizeAspectFill
-        sl.opacity      = 1
-        sl.backgroundColor = UIColor.clear.cgColor
-        sl.frame        = bounds
-        layer.insertSublayer(sl, at: 0)
-        sampleLayer     = sl
-
-        // AVPlayerLooper handles seamless looping natively — no manual seek needed
+        // Apple's recommended approach for HEVC+Alpha: plain AVPlayerLayer with
+        // backgroundColor = nil. The layer composites the video's alpha channel
+        // directly — no manual frame pumping required.
         let item   = AVPlayerItem(url: url)
         let qp     = AVQueuePlayer()
         qp.isMuted = true
         let looper = AVPlayerLooper(player: qp, templateItem: item)
-        player      = qp
-        playerLooper = looper   // must retain or looping stops
-
-        let vo = AVPlayerItemVideoOutput(outputSettings: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
-        ])
-        // Add output to the looper's current item once ready, then play continuously
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self, weak qp] in
-            qp?.currentItem?.add(vo)
-            self?.videoOutput = vo
-            qp?.play()
-        }
-
-        // CADisplayLink pushes frames to sampleLayer
-        let link = CADisplayLink(target: self, selector: #selector(tick))
-        link.add(to: .main, forMode: .common)
-        displayLink = link
-    }
-
-    // MARK: - Frame rendering
-
-    @objc private func tick() {
-        guard let player, player.timeControlStatus == .playing,
-              let sl = sampleLayer else { return }
-        // AVPlayerLooper swaps currentItem on each loop — reattach output if needed
-        if let vo = videoOutput, let current = player.currentItem, !current.outputs.contains(vo) {
-            current.add(vo)
-        }
-        guard let vo = videoOutput else { return }
-        let t = player.currentTime()
-        guard vo.hasNewPixelBuffer(forItemTime: t),
-              let pb = vo.copyPixelBuffer(forItemTime: t, itemTimeForDisplay: nil) else { return }
-        // Flush before first frame of each loop to reset sampleLayer timeline
-        push(pb, at: t, to: sl)
-    }
-
-    private var lastPushedTime: CMTime = .invalid
-
-    private func push(_ pb: CVPixelBuffer, at time: CMTime,
-                       to sl: AVSampleBufferDisplayLayer) {
-        // Detect loop (time jumped backwards) — flush so layer accepts new timeline
-        if lastPushedTime.isValid && time < lastPushedTime {
-            sl.flush()
-        }
-        lastPushedTime = time
-
-        var timing = CMSampleTimingInfo(duration: .invalid,
-                                        presentationTimeStamp: time,
-                                        decodeTimeStamp: .invalid)
-        var fmt: CMVideoFormatDescription?
-        CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil,
-                                                     imageBuffer: pb,
-                                                     formatDescriptionOut: &fmt)
-        guard let fmt else { return }
-        var sb: CMSampleBuffer?
-        CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: pb,
-                                                  formatDescription: fmt,
-                                                  sampleTiming: &timing,
-                                                  sampleBufferOut: &sb)
-        guard let sb else { return }
-        if sl.isReadyForMoreMediaData { sl.enqueue(sb) }
+        let pl     = AVPlayerLayer()
+        pl.player          = qp
+        pl.videoGravity    = .resizeAspectFill
+        pl.frame           = bounds
+        pl.backgroundColor = nil   // essential — lets alpha channel through
+        layer.insertSublayer(pl, at: 0)
+        alphaPlayerLayer = pl
+        player       = qp
+        playerLooper = looper
     }
 
     // MARK: - Helpers
 
     private func cleanup() {
-        displayLink?.invalidate()
         playerLooper = nil
         player?.pause()
     }

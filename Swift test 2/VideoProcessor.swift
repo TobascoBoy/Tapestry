@@ -1,7 +1,6 @@
 import AVFoundation
 import Vision
 import UIKit
-import CoreImage
 
 // MARK: - VideoProcessor
 
@@ -66,13 +65,13 @@ final class VideoProcessor {
 
         let asset   = AVURLAsset(url: inputURL)
         let dur     = try await asset.load(.duration)
-        let capSecs = min(CMTimeGetSeconds(dur), 15.0)
+        let capSecs = min(CMTimeGetSeconds(dur), 10.0)
 
         guard let track = try await asset.loadTracks(withMediaType: .video).first
         else { throw Err("No video track") }
 
         let fps        = Double(try await track.load(.nominalFrameRate))
-        let writeFPS   = min(max(fps, 1.0), 30.0)
+        let writeFPS   = min(max(fps, 1.0), 15.0) // 15 fps keeps encoding fast
         let frameCount = Int(capSecs * writeFPS)
         let frameDur   = 1.0 / writeFPS
 
@@ -118,37 +117,124 @@ final class VideoProcessor {
         writer.startWriting()
         writer.startSession(atSourceTime: .zero)
 
+        // Signal immediately so the UI never shows 0% while detection runs.
+        await MainActor.run { progress(0.01) }
+
+        // Detect person in first frame to choose the right segmentation path.
+        let personDetect = VNDetectHumanRectanglesRequest()
+        let detectHandler = VNImageRequestHandler(cgImage: firstFrame, options: [:])
+        try? detectHandler.perform([personDetect])
+        let hasPerson = personDetect.results?.contains { $0.confidence > 0.5 } ?? false
+
+        // Person path uses the pre-warmed VNGeneratePersonSegmentationRequest (better edges).
+        // Falls back to VNGenerateForegroundInstanceMaskRequest if not warmed up or not a person.
+        let personReq: VNGeneratePersonSegmentationRequest? = {
+            // Use static isWarmedUp — never triggers lazy init, never blocks this thread.
+            guard hasPerson, PersonSegmentationWarmup.isWarmedUp else { return nil }
+            let r = VNGeneratePersonSegmentationRequest()
+            r.qualityLevel = .balanced
+            r.outputPixelFormat = kCVPixelFormatType_OneComponent8
+            return r
+        }()
         let visionReq = VNGenerateForegroundInstanceMaskRequest()
-        let progressInterval = max(1, frameCount / 50) // ~50 UI updates regardless of length
+        let progressInterval = max(1, frameCount / 100)
 
         for i in 0..<frameCount {
             let time = CMTime(seconds: Double(i) * frameDur, preferredTimescale: 600)
             guard let cg = try? gen.copyCGImage(at: time, actualTime: nil) else { continue }
 
-            let buf = maskedPixelBuffer(from: cg, outSize: outSize, request: visionReq)
+            // Per-frame: try person segmentation, fall back to foreground mask if it returns nil.
+            let buf: CVPixelBuffer
+            if let personReq, let personBuf = personMaskedPixelBuffer(from: cg, outSize: outSize, request: personReq) {
+                buf = personBuf
+            } else {
+                buf = maskedPixelBuffer(from: cg, outSize: outSize, request: visionReq)
+            }
+
             while !writerInput.isReadyForMoreMediaData { await Task.yield() }
             adaptor.append(buf, withPresentationTime: time)
 
             if i % progressInterval == 0 || i == frameCount - 1 {
-                let p = Float(i + 1) / Float(frameCount)
+                // Cap at 0.88 — the remaining 12% is reserved for HEVC encoding + thumbnail
+                let p = Float(i + 1) / Float(frameCount) * 0.88
                 await MainActor.run { progress(p) }
-                // Sleep one display frame so CADisplayLink fires and SwiftUI renders
-                // before we queue the next update
                 try? await Task.sleep(nanoseconds: 16_700_000)
             }
         }
 
+        await MainActor.run { progress(0.90) }
         writerInput.markAsFinished()
         await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
             writer.finishWriting { c.resume() }
         }
         if writer.status == .failed { throw writer.error ?? Err("Writer failed") }
 
+        await MainActor.run { progress(0.97) }
+        let thumbnail = makeThumbnail(outURL, masked: true)
         await MainActor.run { progress(1.0) }
-        return Result(outputURL: outURL, thumbnail: makeThumbnail(outURL, masked: true), duration: capSecs, bgRemoved: true)
+        return Result(outputURL: outURL, thumbnail: thumbnail, duration: capSecs, bgRemoved: true)
     }
 
     // MARK: - Core: Vision mask → BGRA pixel buffer with real alpha
+
+    /// Person segmentation path — CGContext clip approach avoids CIImage pipeline issues.
+    /// Returns nil on failure so the caller can fall back to maskedPixelBuffer.
+    private static func personMaskedPixelBuffer(
+        from cgImage: CGImage,
+        outSize: CGSize,
+        request: VNGeneratePersonSegmentationRequest
+    ) -> CVPixelBuffer? {
+        let outW = Int(outSize.width)
+        let outH = Int(outSize.height)
+
+        let handler = VNImageRequestHandler(cgImage: cgImage, orientation: .up, options: [:])
+        guard (try? handler.perform([request])) != nil,
+              let observation = request.results?.first
+        else { return nil }
+
+        let maskBuffer = observation.pixelBuffer
+        let maskW = CVPixelBufferGetWidth(maskBuffer)
+        let maskH = CVPixelBufferGetHeight(maskBuffer)
+
+        // Convert the grayscale mask pixel buffer → CGImage
+        CVPixelBufferLockBaseAddress(maskBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(maskBuffer, .readOnly) }
+
+        guard let maskCtx = CGContext(
+            data:             CVPixelBufferGetBaseAddress(maskBuffer),
+            width:            maskW,
+            height:           maskH,
+            bitsPerComponent: 8,
+            bytesPerRow:      CVPixelBufferGetBytesPerRow(maskBuffer),
+            space:            CGColorSpaceCreateDeviceGray(),
+            bitmapInfo:       CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue)
+        ), let maskCGImage = maskCtx.makeImage() else { return nil }
+
+        // Create output buffer (zeroed = fully transparent)
+        let out = clearBuffer(width: outW, height: outH)
+        CVPixelBufferLockBaseAddress(out, [])
+        defer { CVPixelBufferUnlockBaseAddress(out, []) }
+
+        guard let ctx = CGContext(
+            data:             CVPixelBufferGetBaseAddress(out),
+            width:            outW,
+            height:           outH,
+            bitsPerComponent: 8,
+            bytesPerRow:      CVPixelBufferGetBytesPerRow(out),
+            space:            CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo:       CGImageAlphaInfo.premultipliedFirst.rawValue |
+                              CGBitmapInfo.byteOrder32Little.rawValue
+        ) else { return nil }
+
+        let outRect = CGRect(x: 0, y: 0, width: outW, height: outH)
+
+        // Clip to person mask — pixels outside the mask remain transparent (zero alpha).
+        // Both the mask and source CGImage are drawn in CGContext's y-up space, so they
+        // are flipped consistently and align correctly with each other.
+        ctx.clip(to: outRect, mask: maskCGImage)
+        ctx.draw(cgImage, in: outRect)
+        return out
+    }
 
     private static func maskedPixelBuffer(
         from cgImage: CGImage,

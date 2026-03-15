@@ -31,9 +31,10 @@ struct Swift_test_2App: App {
             }
             .preferredColorScheme(preferredColorScheme)
             .onAppear {
-                DispatchQueue.global(qos: .utility).async {
-                    _ = NatureSegmentationProcessor.shared
-                }
+                // Run in parallel — NatureSegmenter loads a large CoreML model and
+                // must not block PersonSegmentationWarmup from starting.
+                DispatchQueue.global(qos: .utility).async { _ = NatureSegmentationProcessor.shared }
+                DispatchQueue.global(qos: .utility).async { _ = PersonSegmentationWarmup.shared }
             }
             .onChange(of: auth.isSignedIn) { _, signedIn in
                 if signedIn {

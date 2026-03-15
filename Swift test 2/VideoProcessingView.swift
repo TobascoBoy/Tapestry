@@ -108,7 +108,7 @@ struct VideoProcessingView: View {
 
     private func processingView(_ prog: Float) -> some View {
         VStack(spacing: 16) {
-            Text(prog < 1.0 ? "Processing video…" : "Finishing up…")
+            Text(prog < 0.89 ? "Removing background…" : prog < 0.95 ? "Encoding video…" : prog < 1.0 ? "Creating preview…" : "Done!")
                 .font(.headline)
             Text("\(Int(prog * 100))%")
                 .font(.title2.monospacedDigit().weight(.semibold))
