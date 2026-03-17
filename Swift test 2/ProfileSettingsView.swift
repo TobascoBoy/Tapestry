@@ -53,6 +53,9 @@ struct ProfileSettingsView: View {
                                 coverPhotoData = data
                                 try? data.write(to: photoURL)
                                 hasPhoto = true
+                                if let uid = auth.userID {
+                                    await ProfileService.uploadAvatar(data, userID: uid)
+                                }
                             }
                         }
                     }
@@ -109,8 +112,14 @@ struct ProfileSettingsView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") { dismiss() }
-                        .fontWeight(.semibold)
+                    Button("Done") {
+                        if let uid = auth.userID {
+                            ProfileService.saveText(userID: uid, name: name,
+                                                    bio: bio, pronouns: pronouns)
+                        }
+                        dismiss()
+                    }
+                    .fontWeight(.semibold)
                 }
             }
             .onAppear {

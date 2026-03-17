@@ -5,6 +5,19 @@ import PhotosUI
 // MARK: - Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+private extension View {
+    /// Attaches a gesture simultaneously (so ancestor scroll views can still
+    /// scroll) only when `enabled` is true.
+    @ViewBuilder
+    func simultaneousGesture<G: Gesture>(when enabled: Bool, _ gesture: @autoclosure () -> G) -> some View {
+        if enabled {
+            self.simultaneousGesture(gesture())
+        } else {
+            self
+        }
+    }
+}
+
 private func initials(from name: String) -> String {
     let words = name.split(separator: " ").filter { !$0.isEmpty }
     switch words.count {
@@ -26,7 +39,9 @@ struct ProfileView: View {
 
     @AppStorage("profile_name")        private var profileName:        String = ""
     @AppStorage("profile_bio")         private var profileBio:         String = ""
+    @AppStorage("profile_pronouns")    private var profilePronouns:    String = ""
     @AppStorage("profile_has_photo")   private var hasPhoto:           Bool   = false
+    @AppStorage("profile_avatar_url")  private var profileAvatarURL:   String = ""
     @AppStorage("pinned_tapestry_id")  private var pinnedTapestryIDStr: String = ""
 
     private var pinnedTapestry: Tapestry? {
@@ -65,16 +80,15 @@ struct ProfileView: View {
     @State private var entryFlash:         Bool          = false
     @State private var tapestryToDelete:   Tapestry?     = nil
     @State private var tapestryToLeave:    Tapestry?     = nil
+    @State private var tapestryToRename:   Tapestry?     = nil
+    @State private var renameText:         String        = ""
     @State private var coverPickTapestry:  Tapestry?     = nil
     @State private var coverPickAspectRatio: CGFloat     = 1.0
 
-    // Reorder state
-    @State private var isReordering  = false
+    // Edit-layout state: tap = cycle shape, drag = reorder
+    @State private var isEditingLayout = false
     @State private var draggingID:   UUID?   = nil
     @State private var previewOrder: [UUID]  = []
-
-    // Layout-editing state (tap covers to cycle shape)
-    @State private var isEditingLayout = false
 
     // Width of the grid (updated by GeometryReader inside the grid)
     @State private var gridWidth: CGFloat = UIScreen.main.bounds.width - 32
@@ -106,8 +120,22 @@ struct ProfileView: View {
                     ProfileSettingsView().environment(auth)
                 }
                 .onChange(of: showSettings) { _, open in
-                    if !open, hasPhoto, let d = try? Data(contentsOf: avatarURL) {
-                        profilePhotoData = d
+                    if !open {
+                        if let d = try? Data(contentsOf: avatarURL) {
+                            profilePhotoData = d
+                        } else if !profileAvatarURL.isEmpty,
+                                  let url = URL(string: profileAvatarURL) {
+                            Task {
+                                if let (data, resp) = try? await URLSession.shared.data(from: url),
+                                   let http = resp as? HTTPURLResponse, http.statusCode == 200 {
+                                    try? data.write(to: avatarURL)
+                                    await MainActor.run {
+                                        profilePhotoData = data
+                                        hasPhoto = true
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 .sheet(item: $createType) { type in
@@ -171,7 +199,23 @@ struct ProfileView: View {
                 } message: { tapestry in
                     Text("This removes \"\(tapestry.title)\" from your profile. Other members will still have access and the tapestry will not be deleted.")
                 }
+                .alert("Rename Tapestry", isPresented: Binding(
+                    get: { tapestryToRename != nil },
+                    set: { if !$0 { tapestryToRename = nil } }
+                )) {
+                    TextField("Name", text: $renameText)
+                    Button("Rename") {
+                        if let t = tapestryToRename {
+                            store.rename(t, to: renameText)
+                        }
+                        tapestryToRename = nil
+                    }
+                    Button("Cancel", role: .cancel) { tapestryToRename = nil }
+                } message: {
+                    Text("Enter a new name for this tapestry.")
+                }
                 .onAppear { loadAvatarPhoto() }
+                .onChange(of: profileAvatarURL) { _, _ in loadAvatarPhoto() }
                 .onTapGesture {
                     if showTypePopup {
                         withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
@@ -293,11 +337,24 @@ struct ProfileView: View {
                 }
             }
 
-            // Name
-            Text(displayName)
-                .font(.system(size: 24, weight: .bold))
-                .foregroundStyle(.primary)
-                .padding(.top, 4)
+            // Hidden pronouns on the left balance the visible ones on the right,
+            // so the name's center stays at screen center.
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                if !profilePronouns.trimmingCharacters(in: .whitespaces).isEmpty {
+                    Text(profilePronouns)
+                        .font(.system(size: 13))
+                        .hidden()
+                }
+                Text(displayName)
+                    .font(.system(size: 24, weight: .bold))
+                    .foregroundStyle(.primary)
+                if !profilePronouns.trimmingCharacters(in: .whitespaces).isEmpty {
+                    Text(profilePronouns)
+                        .font(.system(size: 13))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.top, 4)
 
             // Bio
             if !profileBio.trimmingCharacters(in: .whitespaces).isEmpty {
@@ -537,22 +594,14 @@ struct ProfileView: View {
                 if isEditingLayout {
                     Button("Done") {
                         withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                            isEditingLayout = false
-                        }
-                    }
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(.blue)
-                } else if isReordering {
-                    Button("Done") {
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
                             if !previewOrder.isEmpty {
                                 let byID = Dictionary(uniqueKeysWithValues: unpinnedTapestries.map { ($0.id, $0) })
                                 let ordered = previewOrder.compactMap { byID[$0] }
                                 store.setDisplayOrder(to: ordered)
                             }
-                            isReordering = false
-                            draggingID   = nil
-                            previewOrder = []
+                            isEditingLayout = false
+                            draggingID      = nil
+                            previewOrder    = []
                         }
                     }
                     .font(.system(size: 15, weight: .semibold))
@@ -648,7 +697,7 @@ struct ProfileView: View {
             .clipped()
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay(alignment: .topTrailing) {
-                if isReordering {
+                if isEditingLayout {
                     Image(systemName: "line.3.horizontal")
                         .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(.white)
@@ -685,7 +734,7 @@ struct ProfileView: View {
         .onTapGesture {
             if isEditingLayout {
                 cycleShape(for: tapestry)
-            } else if !isReordering {
+            } else {
                 enterTapestry(tapestry)
             }
         }
@@ -703,11 +752,16 @@ struct ProfileView: View {
                 Label("Edit Cover", systemImage: "crop")
             }
             Button {
+                renameText      = tapestry.title
+                tapestryToRename = tapestry
+            } label: {
+                Label("Rename", systemImage: "pencil")
+            }
+            Button {
                 withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                    previewOrder    = unpinnedTapestries.map(\.id)
                     isEditingLayout = true
-                    isReordering    = false
                     draggingID      = nil
-                    previewOrder    = []
                 }
             } label: {
                 Label("Edit Layout", systemImage: "square.grid.2x2")
@@ -716,15 +770,6 @@ struct ProfileView: View {
                 withAnimation { pinnedTapestryIDStr = tapestry.id.uuidString }
             } label: {
                 Label("Pin to Profile", systemImage: "pin")
-            }
-            Button {
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                    previewOrder    = unpinnedTapestries.map(\.id)
-                    isReordering    = true
-                    isEditingLayout = false
-                }
-            } label: {
-                Label("Move", systemImage: "arrow.up.arrow.down")
             }
             if tapestry.ownerID == store.currentUserID {
                 Button(role: .destructive) {
@@ -740,34 +785,41 @@ struct ProfileView: View {
                 }
             }
         }
-        .gesture(
-            isReordering
-            ? DragGesture(minimumDistance: 6, coordinateSpace: .named("tapestryGrid"))
+        .simultaneousGesture(when: isEditingLayout,
+            LongPressGesture(minimumDuration: 0.4)
+                .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .named("tapestryGrid")))
                 .onChanged { value in
-                    if draggingID != tapestry.id {
-                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                        draggingID = tapestry.id
-                        if previewOrder.isEmpty {
-                            previewOrder = unpinnedTapestries.map(\.id)
+                    switch value {
+                    case .second(true, let drag):
+                        if draggingID != tapestry.id {
+                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                            draggingID = tapestry.id
+                            if previewOrder.isEmpty {
+                                previewOrder = unpinnedTapestries.map(\.id)
+                            }
+                        }
+                        guard let dragVal = drag else { return }
+                        let targetIdx = gridTargetIndex(at: dragVal.location, taps: displayedTapestries)
+                        guard let fromIdx = previewOrder.firstIndex(of: tapestry.id),
+                              targetIdx != fromIdx else { return }
+                        var newOrder = previewOrder
+                        newOrder.remove(at: fromIdx)
+                        newOrder.insert(tapestry.id, at: targetIdx)
+                        previewOrder = newOrder
+                    default:
+                        break
+                    }
+                }
+                .onEnded { value in
+                    if case .second(true, _) = value {
+                        let byID = Dictionary(uniqueKeysWithValues: unpinnedTapestries.map { ($0.id, $0) })
+                        let ordered = previewOrder.compactMap { byID[$0] }
+                        if !ordered.isEmpty { store.setDisplayOrder(to: ordered) }
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
+                            draggingID = nil
                         }
                     }
-                    let targetIdx = gridTargetIndex(at: value.location, taps: displayedTapestries)
-                    guard let fromIdx = previewOrder.firstIndex(of: tapestry.id),
-                          targetIdx != fromIdx else { return }
-                    var newOrder = previewOrder
-                    newOrder.remove(at: fromIdx)
-                    newOrder.insert(tapestry.id, at: targetIdx)
-                    previewOrder = newOrder
                 }
-                .onEnded { _ in
-                    let byID = Dictionary(uniqueKeysWithValues: unpinnedTapestries.map { ($0.id, $0) })
-                    let ordered = previewOrder.compactMap { byID[$0] }
-                    if !ordered.isEmpty { store.setDisplayOrder(to: ordered) }
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
-                        draggingID = nil
-                    }
-                }
-            : nil
         )
     }
 
@@ -1023,7 +1075,20 @@ struct ProfileView: View {
     }
 
     private func loadAvatarPhoto() {
-        if hasPhoto, let d = try? Data(contentsOf: avatarURL) { profilePhotoData = d }
+        if let d = try? Data(contentsOf: avatarURL) {
+            profilePhotoData = d
+        } else if !profileAvatarURL.isEmpty, let url = URL(string: profileAvatarURL) {
+            Task {
+                if let (data, resp) = try? await URLSession.shared.data(from: url),
+                   let http = resp as? HTTPURLResponse, http.statusCode == 200 {
+                    try? data.write(to: avatarURL)
+                    await MainActor.run {
+                        profilePhotoData = data
+                        hasPhoto = true
+                    }
+                }
+            }
+        }
     }
 }
 

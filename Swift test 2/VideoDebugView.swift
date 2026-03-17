@@ -1,3 +1,4 @@
+#if DEBUG
 import SwiftUI
 import AVFoundation
 import Vision
@@ -232,3 +233,4 @@ struct VideoDebugView: View {
         return pb
     }
 }
+#endif

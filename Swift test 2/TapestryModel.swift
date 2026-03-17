@@ -54,6 +54,7 @@ struct Tapestry: Identifiable, Codable, Hashable {
     var title: String
     var description: String
     var thumbnailFilename: String?   // local disk cache
+    var thumbnailURL: String?        // remote Supabase Storage URL
     let createdAt: Date
     var updatedAt: Date
     var type: TapestryType
@@ -66,6 +67,7 @@ struct Tapestry: Identifiable, Codable, Hashable {
         title: String,
         description: String = "",
         thumbnailFilename: String? = nil,
+        thumbnailURL: String? = nil,
         createdAt: Date = Date(),
         updatedAt: Date = Date(),
         type: TapestryType = .personal,
@@ -77,6 +79,7 @@ struct Tapestry: Identifiable, Codable, Hashable {
         self.title = title
         self.description = description
         self.thumbnailFilename = thumbnailFilename
+        self.thumbnailURL = thumbnailURL
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.type = type
@@ -124,18 +127,20 @@ private struct TapestryRow: Decodable {
     let createdAt: String
     let updatedAt: String
     let canvasData: String?
-    let canvasMode: String?   // nil for rows created before the column was added → defaults to .infinite
+    let canvasMode: String?      // nil for rows created before the column was added → defaults to .infinite
+    let thumbnailURL: String?    // nil if cover not yet uploaded
 
     enum CodingKeys: String, CodingKey {
         case id
-        case ownerID    = "owner_id"
+        case ownerID      = "owner_id"
         case title
         case description
         case type
-        case createdAt  = "created_at"
-        case updatedAt  = "updated_at"
-        case canvasData = "canvas_data"
-        case canvasMode = "canvas_mode"
+        case createdAt    = "created_at"
+        case updatedAt    = "updated_at"
+        case canvasData   = "canvas_data"
+        case canvasMode   = "canvas_mode"
+        case thumbnailURL = "thumbnail_url"
     }
 
     func toTapestry() -> Tapestry {
@@ -144,6 +149,7 @@ private struct TapestryRow: Decodable {
             title: title,
             description: description,
             thumbnailFilename: nil,
+            thumbnailURL: thumbnailURL,
             createdAt: Self.parseDate(createdAt),
             updatedAt: Self.parseDate(updatedAt),
             type: TapestryType(rawValue: type) ?? .personal,
@@ -287,9 +293,17 @@ final class TapestryStore {
 
             await MainActor.run {
                 let thumbMap = savedThumbnailMap
+                let dir = thumbsDir
                 tapestries = all.map { row in
                     var t = row.toTapestry()
-                    t.thumbnailFilename = thumbMap[row.id.uuidString]
+                    let localFilename = thumbMap[row.id.uuidString]
+                    t.thumbnailFilename = localFilename
+                    // If the local file no longer exists but we have a remote URL, clear
+                    // the stale filename so thumbnail(for:) falls through to downloadThumbnail.
+                    if let fn = localFilename,
+                       !FileManager.default.fileExists(atPath: dir.appendingPathComponent(fn).path) {
+                        t.thumbnailFilename = nil
+                    }
                     return t
                 }
                 let activeIDs = Set(tapestries.map(\.id))
@@ -357,6 +371,26 @@ final class TapestryStore {
         }
     }
 
+    func rename(_ tapestry: Tapestry, to newTitle: String) {
+        let trimmed = newTitle.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        if let idx = tapestries.firstIndex(where: { $0.id == tapestry.id }) {
+            tapestries[idx].title = trimmed
+        }
+        Task {
+            do {
+                struct TitleUpdate: Encodable { let title: String }
+                try await supabase
+                    .from("tapestries")
+                    .update(TitleUpdate(title: trimmed))
+                    .eq("id", value: tapestry.id.uuidString)
+                    .execute()
+            } catch {
+                print("TapestryStore.rename error: \(error)")
+            }
+        }
+    }
+
     func delete(_ tapestry: Tapestry) {
         tapestries.removeAll { $0.id == tapestry.id }
         tapestryOrder.removeAll { $0 == tapestry.id }
@@ -418,7 +452,7 @@ final class TapestryStore {
         }
     }
 
-    // MARK: - Thumbnail helpers (local disk, Storage upload coming later)
+    // MARK: - Thumbnail helpers
 
     func saveThumbnail(_ image: UIImage, for tapestryID: UUID) -> String? {
         thumbnailCache[tapestryID] = image          // cache immediately in memory
@@ -426,19 +460,77 @@ final class TapestryStore {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let filename = "\(tapestryID.uuidString).jpg"
         guard let data = image.jpegData(compressionQuality: 0.92) else { return nil }
-        let url = dir.appendingPathComponent(filename)
-        try? data.write(to: url)
+        let fileURL = dir.appendingPathComponent(filename)
+        try? data.write(to: fileURL)
+
+        // Upload to Supabase Storage in the background so the cover survives reinstall
+        Task.detached(priority: .utility) { [weak self] in
+            let path = "thumbnails/\(tapestryID.uuidString).jpg"
+            do {
+                try await supabase.storage
+                    .from("sticker-assets")
+                    .upload(path, data: data,
+                            options: .init(contentType: "image/jpeg", upsert: true))
+                let remoteURL = try supabase.storage
+                    .from("sticker-assets")
+                    .getPublicURL(path: path)
+                    .absoluteString
+                struct ThumbUpdate: Encodable { let thumbnail_url: String }
+                try await supabase
+                    .from("tapestries")
+                    .update(ThumbUpdate(thumbnail_url: remoteURL))
+                    .eq("id", value: tapestryID.uuidString)
+                    .execute()
+                await MainActor.run {
+                    if let i = self?.tapestries.firstIndex(where: { $0.id == tapestryID }) {
+                        self?.tapestries[i].thumbnailURL = remoteURL
+                    }
+                }
+            } catch {
+                print("[TapestryStore] thumbnail upload error: \(error)")
+            }
+        }
+
         return filename
     }
 
     func thumbnail(for tapestry: Tapestry) -> UIImage? {
         // Serve from memory cache — zero disk I/O on subsequent calls
         if let cached = thumbnailCache[tapestry.id] { return cached }
-        guard let fn = tapestry.thumbnailFilename else { return nil }
-        let url = thumbsDir.appendingPathComponent(fn)
-        let img = UIImage(contentsOfFile: url.path)
-        if let img { thumbnailCache[tapestry.id] = img }   // populate cache for next time
-        return img
+
+        // Try local disk
+        if let fn = tapestry.thumbnailFilename {
+            let url = thumbsDir.appendingPathComponent(fn)
+            if let img = UIImage(contentsOfFile: url.path) {
+                thumbnailCache[tapestry.id] = img
+                return img
+            }
+        }
+
+        // Local file missing — download from remote URL if we have one
+        if let urlString = tapestry.thumbnailURL {
+            downloadThumbnail(tapestryID: tapestry.id, urlString: urlString)
+        }
+        return nil
+    }
+
+    private func downloadThumbnail(tapestryID: UUID, urlString: String) {
+        // Skip if already downloading or already cached
+        guard thumbnailCache[tapestryID] == nil else { return }
+        guard let url = URL(string: urlString) else { return }
+        let dir = thumbsDir   // capture before going off MainActor
+        Task.detached(priority: .utility) { [weak self] in
+            guard let (data, response) = try? await URLSession.shared.data(from: url),
+                  let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  let img = UIImage(data: data) else { return }
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let filename = "\(tapestryID.uuidString).jpg"
+            try? data.write(to: dir.appendingPathComponent(filename))
+            await MainActor.run {
+                self?.thumbnailCache[tapestryID] = img
+                self?.updateThumbnailFilename(tapestryID: tapestryID, filename: filename)
+            }
+        }
     }
 
     func updateThumbnailFilename(tapestryID: UUID, filename: String) {

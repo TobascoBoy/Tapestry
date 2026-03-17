@@ -19,6 +19,13 @@ final class VideoStickerUIView: UIView {
     private var playerLooper: AVPlayerLooper?
     private var isBgRemoved   = false
 
+    // Pixel-perfect hit testing for bg-removed video
+    private var videoOutput:       AVPlayerItemVideoOutput?
+    private var hitTestImage:      CGImage?
+    private var maskRefreshTimer:  Timer?
+    private var loopObserver:      NSObjectProtocol?
+    private let ciContext          = CIContext(options: [.useSoftwareRenderer: false])
+
     // Overlays
     private let border        = UIView()
 
@@ -139,30 +146,122 @@ final class VideoStickerUIView: UIView {
         // Apple's recommended approach for HEVC+Alpha: plain AVPlayerLayer with
         // backgroundColor = nil. The layer composites the video's alpha channel
         // directly — no manual frame pumping required.
-        let item   = AVPlayerItem(url: url)
-        let qp     = AVQueuePlayer()
-        qp.isMuted = true
-        let looper = AVPlayerLooper(player: qp, templateItem: item)
-        let pl     = AVPlayerLayer()
-        pl.player          = qp
+
+        // IMPORTANT: use plain AVPlayer (not AVQueuePlayer + AVPlayerLooper).
+        // AVPlayerLooper creates *copies* of the template AVPlayerItem — our
+        // AVPlayerItemVideoOutput would be attached to the template only, meaning
+        // copyPixelBuffer() returns nil for every frame after the first loop.
+        // With plain AVPlayer we keep one item forever and seek to zero on end.
+        let outputSettings: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ]
+        let output = AVPlayerItemVideoOutput(outputSettings: outputSettings)
+        videoOutput = output
+
+        let item = AVPlayerItem(url: url)
+        item.add(output)
+
+        let ap     = AVPlayer(playerItem: item)
+        ap.isMuted = true
+
+        // Loop by seeking back to zero when playback reaches the end
+        loopObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak ap] _ in
+            ap?.seek(to: .zero, completionHandler: { _ in ap?.play() })
+        }
+
+        let pl = AVPlayerLayer()
+        pl.player          = ap
         pl.videoGravity    = .resizeAspectFill
         pl.frame           = bounds
         pl.backgroundColor = nil   // essential — lets alpha channel through
         layer.insertSublayer(pl, at: 0)
         alphaPlayerLayer = pl
-        player       = qp
-        playerLooper = looper
+        player       = ap
+        playerLooper = nil   // not used for bg-removed
+
+        // Capture the first hit-test mask once the player has its initial frame,
+        // then refresh every 0.5 s so the mask tracks a moving subject.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.refreshHitTestMask()
+            self?.maskRefreshTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+                self?.refreshHitTestMask()
+            }
+        }
+    }
+
+    private func refreshHitTestMask() {
+        guard let output = videoOutput,
+              let time   = player?.currentTime() else { return }
+        var displayTime  = CMTime.zero
+        guard let pixelBuffer = output.copyPixelBuffer(forItemTime: time,
+                                                        itemTimeForDisplay: &displayTime) else { return }
+        // CIContext.createCGImage copies the pixel data so the CGImage is safe
+        // to use after the pixel buffer is released.
+        let ciImage  = CIImage(cvPixelBuffer: pixelBuffer)
+        hitTestImage = ciContext.createCGImage(ciImage, from: ciImage.extent)
     }
 
     // MARK: - Helpers
 
     private func cleanup() {
+        maskRefreshTimer?.invalidate()
+        maskRefreshTimer = nil
+        if let obs = loopObserver {
+            NotificationCenter.default.removeObserver(obs)
+            loopObserver = nil
+        }
         playerLooper = nil
         player?.pause()
     }
 
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
-        bounds.contains(point)
+        guard isBgRemoved else { return bounds.contains(point) }
+        guard bounds.contains(point) else { return false }
+
+        // No mask yet — be permissive until the first frame is captured
+        guard let cgImage = hitTestImage else { return true }
+
+        let imgW = cgImage.width
+        let imgH = cgImage.height
+
+        // Map view point → image pixel, accounting for resizeAspectFill crop
+        let videoAspect = CGFloat(imgW) / CGFloat(imgH)
+        let viewAspect  = bounds.width  / bounds.height
+        let scale: CGFloat
+        let offsetX: CGFloat
+        let offsetY: CGFloat
+        if videoAspect > viewAspect {
+            // Video wider than view — cropped on left/right
+            scale   = bounds.height / CGFloat(imgH)
+            offsetX = (bounds.width - CGFloat(imgW) * scale) / 2
+            offsetY = 0
+        } else {
+            // Video taller than view — cropped on top/bottom
+            scale   = bounds.width / CGFloat(imgW)
+            offsetX = 0
+            offsetY = (bounds.height - CGFloat(imgH) * scale) / 2
+        }
+
+        let px = Int((point.x - offsetX) / scale)
+        let py = Int((point.y - offsetY) / scale)
+        guard px >= 0, px < imgW, py >= 0, py < imgH else { return false }
+
+        // 1×1 CGContext trick — draw the full image offset so the target pixel
+        // lands at (0,0), then read the alpha byte. Same approach as StickerUIView.
+        guard let ctx = CGContext(data: nil, width: 1, height: 1,
+                                  bitsPerComponent: 8, bytesPerRow: 4,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return true }
+        ctx.draw(cgImage, in: CGRect(x: -px, y: -(imgH - py - 1),
+                                     width: imgW, height: imgH))
+        guard let data = ctx.data else { return true }
+        let alpha = data.load(fromByteOffset: 3, as: UInt8.self)
+        return alpha > 10
     }
 
     /// Captures the current video frame as a UIImage for use in cover photo rendering.

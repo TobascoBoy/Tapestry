@@ -28,10 +28,7 @@ final class MusicPlayerManager: ObservableObject {
     // never blocks or deadlocks the main thread.
     private let observerQueue = DispatchQueue(label: "com.tapestry.music.timeobserver", qos: .userInteractive)
 
-    private init() {
-        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
-        try? AVAudioSession.sharedInstance().setActive(true)
-    }
+    private init() {}
 
     // MARK: - Public API
 
@@ -42,6 +39,9 @@ final class MusicPlayerManager: ObservableObject {
         }
 
         stop()
+
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+        try? AVAudioSession.sharedInstance().setActive(true)
 
         let item = AVPlayerItem(url: url)
         let newPlayer = AVPlayer(playerItem: item)
@@ -124,5 +124,10 @@ final class MusicPlayerManager: ObservableObject {
         isPlaying = false
         progress = 0
         duration = 0
+
+        // Restore mixing so muted video stickers activating the session
+        // afterward don't interrupt other audio (external or in-app).
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.mixWithOthers])
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 }

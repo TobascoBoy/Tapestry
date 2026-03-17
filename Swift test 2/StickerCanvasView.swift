@@ -84,6 +84,7 @@ struct StickerCanvasView: View {
 
     // Auto-save / collab
     @State private var uploadedURLs: [UUID: String] = [:]
+    @State private var uploadedThumbnailURLs: [UUID: String] = [:]
     @State private var autosaveTask: Task<Void, Never>? = nil
     @State private var canvasLoaded = false
     @State private var showTapestryDeletedAlert = false
@@ -477,6 +478,7 @@ struct StickerCanvasView: View {
             case .video(_, _, let bgRemoved):
                 s.type = "video"; s.bgRemoved = bgRemoved
                 s.videoURL = uploadedURLs[sticker.id]
+                s.videoThumbnailURL = uploadedThumbnailURLs[sticker.id]
             }
             return s
         }
@@ -540,11 +542,16 @@ struct StickerCanvasView: View {
                         // Try Supabase URL first; fall back to local file if URL is
                         // missing (upload was interrupted) or the download fails.
                         let img: UIImage?
-                        if let urlString = s.imageURL,
-                           let localURL = try? await StickerAssetUploader.cachedLocalURL(for: urlString, ext: urlString.hasSuffix(".gif") ? "gif" : "png") {
+                        if let urlString = s.imageURL {
                             let ext = urlString.hasSuffix(".gif") ? "gif" : "png"
-                            img = ext == "gif" ? UIImage.animatedGIF(from: localURL) : UIImage(contentsOfFile: localURL.path)
-                            if img != nil { await MainActor.run { uploadedURLs[s.id] = urlString } }
+                            if let localURL = try? await StickerAssetUploader.cachedLocalURL(for: urlString, ext: ext) {
+                                img = ext == "gif" ? UIImage.animatedGIF(from: localURL) : UIImage(contentsOfFile: localURL.path)
+                                if img != nil { await MainActor.run { uploadedURLs[s.id] = urlString } }
+                            } else if let fn = s.imageFilename {
+                                img = StickerStorage.loadImage(filename: fn)
+                            } else {
+                                img = nil
+                            }
                         } else if let fn = s.imageFilename {
                             img = StickerStorage.loadImage(filename: fn)
                         } else {
@@ -569,7 +576,7 @@ struct StickerCanvasView: View {
                               let localVideoURL = try? await StickerAssetUploader.cachedLocalURL(for: vURL, ext: "mp4"),
                               let localThumbURL = try? await StickerAssetUploader.cachedLocalURL(for: tURL, ext: "png"),
                               let thumb = UIImage(contentsOfFile: localThumbURL.path) else { return nil }
-                        await MainActor.run { uploadedURLs[s.id] = vURL }
+                        await MainActor.run { uploadedURLs[s.id] = vURL; uploadedThumbnailURLs[s.id] = tURL }
                         return Sticker(id: s.id, kind: .video(videoURL: localVideoURL, thumbnail: thumb, bgRemoved: s.bgRemoved ?? false), position: pos, scale: s.scale, rotation: rot, zIndex: s.zIndex)
                     default: return nil
                     }
@@ -602,10 +609,12 @@ struct StickerCanvasView: View {
     }
 
     private func saveCanvas() {
-        guard let tid = tapestryID, !coverPickerMode else { return }
+        guard let tid = tapestryID, canvasLoaded, !coverPickerMode else { return }
+        if isCollaborative && !isOwner { return }
         let stickerSnapshot    = stickers
         let backgroundSnapshot = canvasBackground
-        let urlCacheSnapshot   = uploadedURLs
+        let urlCacheSnapshot      = uploadedURLs
+        let thumbURLCacheSnapshot = uploadedThumbnailURLs
 
         let hasMediaStickers = stickerSnapshot.contains {
             switch $0.kind { case .photo, .video: return true; default: return false }
@@ -689,13 +698,22 @@ struct StickerCanvasView: View {
                     s.type = "video"; s.bgRemoved = bgRemoved
                     if let cached = urlCacheSnapshot[sticker.id] {
                         s.videoURL = cached
-                        s.videoThumbnailURL = try? await StickerAssetUploader.uploadVideoThumbnail(thumb, stickerID: sticker.id)
+                        if let cachedThumb = thumbURLCacheSnapshot[sticker.id] {
+                            s.videoThumbnailURL = cachedThumb
+                        } else {
+                            s.videoThumbnailURL = try? await StickerAssetUploader.uploadVideoThumbnail(thumb, stickerID: sticker.id)
+                            if let tURL = s.videoThumbnailURL { await MainActor.run { uploadedThumbnailURLs[sticker.id] = tURL } }
+                        }
                     } else {
                         s.videoURL = try? await StickerAssetUploader.uploadVideo(from: url, stickerID: sticker.id)
-                        s.videoThumbnailURL = try? await StickerAssetUploader.uploadVideoThumbnail(thumb, stickerID: sticker.id)
                         if let vURL = s.videoURL { await MainActor.run { uploadedURLs[sticker.id] = vURL } }
+                        s.videoThumbnailURL = try? await StickerAssetUploader.uploadVideoThumbnail(thumb, stickerID: sticker.id)
+                        if let tURL = s.videoThumbnailURL { await MainActor.run { uploadedThumbnailURLs[sticker.id] = tURL } }
                     }
                 }
+                // Don't write a video sticker to Supabase if thumbnail URL is missing — loadCanvas()
+                // requires both URLs and would silently drop it. The next save cycle will retry.
+                if s.type == "video" && s.videoThumbnailURL == nil { continue }
                 stickerStates.append(s)
                 if let data = try? JSONEncoder().encode(CanvasState(background: bgState, stickers: stickerStates)),
                    let json = String(data: data, encoding: .utf8) {
@@ -809,6 +827,7 @@ struct StickerCanvasView: View {
                   let thumb = UIImage(contentsOfFile: localThumbURL.path) else { return }
             await MainActor.run {
                 uploadedURLs[state.id] = vURL
+                uploadedThumbnailURLs[state.id] = tURL
                 stickers.append(Sticker(id: state.id, kind: .video(videoURL: localVideoURL, thumbnail: thumb, bgRemoved: state.bgRemoved ?? false), position: pos, scale: state.scale, rotation: rot, zIndex: state.zIndex))
             }
         default: break
@@ -1200,7 +1219,7 @@ extension StickerCanvasView {
             Task(priority: .utility) {
                 guard let vURL = try? await StickerAssetUploader.uploadVideo(from: srcURL, stickerID: sid),
                       let tURL = try? await StickerAssetUploader.uploadVideoThumbnail(thumb, stickerID: sid) else { return }
-                await MainActor.run { uploadedURLs[sid] = vURL }
+                await MainActor.run { uploadedURLs[sid] = vURL; uploadedThumbnailURLs[sid] = tURL }
                 var state = StickerState(id: sid, type: "video",
                     x: pos.x, y: pos.y, scale: 1.0, rotationRadians: 0, zIndex: z)
                 state.videoURL = vURL; state.videoThumbnailURL = tURL; state.bgRemoved = bgRemoved

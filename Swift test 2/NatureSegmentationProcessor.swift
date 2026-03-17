@@ -30,8 +30,10 @@ final class NatureSegmentationProcessor {
     private let model: NatureSegmenter?
 
     private init() {
-        print("[NatureSegmenter] loading model synchronously...")
-        model = try? NatureSegmenter()
+        print("[NatureSegmenter] loading model synchronously (CPU-only)...")
+        let config = MLModelConfiguration()
+        config.computeUnits = .cpuOnly
+        model = try? NatureSegmenter(configuration: config)
         print("[NatureSegmenter] model ready: \(model != nil)")
     }
 
