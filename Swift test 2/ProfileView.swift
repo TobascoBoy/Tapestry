@@ -22,6 +22,7 @@ struct ProfileView: View {
 
     @Environment(TapestryStore.self) private var store
     @Environment(AuthManager.self)   private var auth
+    @Environment(\.colorScheme)      private var colorScheme
 
     @AppStorage("profile_name")        private var profileName:        String = ""
     @AppStorage("profile_bio")         private var profileBio:         String = ""
@@ -59,9 +60,11 @@ struct ProfileView: View {
     @State private var showSettings:       Bool          = false
     @State private var createType:         TapestryType? = nil
     @State private var showTypePopup:      Bool          = false
+    @State private var showJoinView:       Bool          = false
     @State private var openTapestry:       Tapestry?     = nil
     @State private var entryFlash:         Bool          = false
     @State private var tapestryToDelete:   Tapestry?     = nil
+    @State private var tapestryToLeave:    Tapestry?     = nil
     @State private var coverPickTapestry:  Tapestry?     = nil
     @State private var coverPickAspectRatio: CGFloat     = 1.0
 
@@ -110,6 +113,15 @@ struct ProfileView: View {
                 .sheet(item: $createType) { type in
                     CreateTapestryView(tapestryType: type).environment(store)
                 }
+                .sheet(isPresented: $showJoinView) {
+                    JoinTapestryView(onJoined: { joined in
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                            enterTapestry(joined)
+                        }
+                    })
+                    .environment(store)
+                    .environment(auth)
+                }
                 .fullScreenCover(item: $coverPickTapestry) { tapestry in
                     NavigationStack {
                         StickerCanvasView(
@@ -143,6 +155,22 @@ struct ProfileView: View {
                     }
                     Button("Cancel", role: .cancel) { tapestryToDelete = nil }
                 }
+                .alert(
+                    "Remove from your profile?",
+                    isPresented: Binding(
+                        get: { tapestryToLeave != nil },
+                        set: { if !$0 { tapestryToLeave = nil } }
+                    ),
+                    presenting: tapestryToLeave
+                ) { tapestry in
+                    Button("Remove", role: .destructive) {
+                        withAnimation { store.leaveTapestry(tapestry) }
+                        tapestryToLeave = nil
+                    }
+                    Button("Cancel", role: .cancel) { tapestryToLeave = nil }
+                } message: { tapestry in
+                    Text("This removes \"\(tapestry.title)\" from your profile. Other members will still have access and the tapestry will not be deleted.")
+                }
                 .onAppear { loadAvatarPhoto() }
                 .onTapGesture {
                     if showTypePopup {
@@ -168,6 +196,7 @@ struct ProfileView: View {
                     } label: {
                         ZStack {
                             Circle().fill(Color.black).frame(width: 60, height: 60)
+                                .overlay(Circle().strokeBorder(.white.opacity(colorScheme == .dark ? 0.45 : 0), lineWidth: 1.5))
                                 .shadow(color: .black.opacity(0.25), radius: 10, x: 0, y: 5)
                             Image(systemName: showTypePopup ? "xmark" : "plus")
                                 .font(.system(size: 22, weight: .semibold))
@@ -363,6 +392,7 @@ struct ProfileView: View {
                 .padding(12)
             }
             .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
             .shadow(color: .black.opacity(0.14), radius: 10, x: 0, y: 5)
             .padding(.horizontal, 16)
             .onTapGesture { enterTapestry(tapestry) }
@@ -379,13 +409,22 @@ struct ProfileView: View {
                 } label: {
                     Label("Unpin", systemImage: "pin.slash")
                 }
-                Button(role: .destructive) {
-                    tapestryToDelete = tapestry
-                } label: {
-                    Label("Delete", systemImage: "trash")
+                if tapestry.ownerID == store.currentUserID {
+                    Button(role: .destructive) {
+                        tapestryToDelete = tapestry
+                    } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
+                } else {
+                    Button(role: .destructive) {
+                        tapestryToLeave = tapestry
+                    } label: {
+                        Label("Remove", systemImage: "minus.circle")
+                    }
                 }
             }
         }
+        .padding(.top, 4)
         .padding(.bottom, 16)
     }
 
@@ -687,10 +726,18 @@ struct ProfileView: View {
             } label: {
                 Label("Move", systemImage: "arrow.up.arrow.down")
             }
-            Button(role: .destructive) {
-                tapestryToDelete = tapestry
-            } label: {
-                Label("Delete", systemImage: "trash")
+            if tapestry.ownerID == store.currentUserID {
+                Button(role: .destructive) {
+                    tapestryToDelete = tapestry
+                } label: {
+                    Label("Delete", systemImage: "trash")
+                }
+            } else {
+                Button(role: .destructive) {
+                    tapestryToLeave = tapestry
+                } label: {
+                    Label("Remove", systemImage: "minus.circle")
+                }
             }
         }
         .gesture(
@@ -903,6 +950,34 @@ struct ProfileView: View {
                         Text("Group Tapestry")
                             .font(.system(size: 16, weight: .semibold)).foregroundStyle(.primary)
                         Text("Shared canvas")
+                            .font(.system(size: 13)).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 13, weight: .medium)).foregroundStyle(.tertiary)
+                }
+                .padding(.horizontal, 18).padding(.vertical, 14)
+            }
+            .buttonStyle(.plain)
+
+            Divider().padding(.leading, 72)
+
+            Button {
+                withAnimation { showTypePopup = false }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    showJoinView = true
+                }
+            } label: {
+                HStack(spacing: 14) {
+                    ZStack {
+                        Circle().fill(Color.green.opacity(0.12)).frame(width: 40, height: 40)
+                        Image(systemName: "person.badge.plus")
+                            .font(.system(size: 15, weight: .semibold)).foregroundStyle(.green)
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Join Tapestry")
+                            .font(.system(size: 16, weight: .semibold)).foregroundStyle(.primary)
+                        Text("Enter an invite code")
                             .font(.system(size: 13)).foregroundStyle(.secondary)
                     }
                     Spacer()

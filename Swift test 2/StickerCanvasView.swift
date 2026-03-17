@@ -26,8 +26,16 @@ struct StickerCanvasView: View {
     var coverFrameAspectRatio: CGFloat = 1.0   // width / height of target cover shape
     var onCoverPicked: ((UIImage) -> Void)? = nil
     var onCoverCancelled: (() -> Void)? = nil
+    var isCollaborative: Bool = false
+    var isOwner: Bool = true
+    var onDismiss: (() -> Void)? = nil
 
     @Environment(TapestryStore.self) private var store
+    @Environment(AuthManager.self)   private var auth
+    @Environment(\.colorScheme)      private var colorScheme
+    @Environment(\.scenePhase)       private var scenePhase
+
+    @State private var collabSession: TapestryCollabSession? = nil
 
     @State private var stickers: [Sticker] = []
     @State private var selectedStickerID: UUID?
@@ -69,6 +77,17 @@ struct StickerCanvasView: View {
     // Layers panel
     @State private var showLayersPanel = false
 
+    // Invite
+    @State private var isGeneratingInvite = false
+    @State private var pendingInviteToken: String? = nil
+    @State private var inviteError: String? = nil
+
+    // Auto-save / collab
+    @State private var uploadedURLs: [UUID: String] = [:]
+    @State private var autosaveTask: Task<Void, Never>? = nil
+    @State private var canvasLoaded = false
+    @State private var showTapestryDeletedAlert = false
+
     // Undo
     @State private var undoStack: [CanvasSnapshot] = []
 
@@ -76,238 +95,101 @@ struct StickerCanvasView: View {
     @State private var canvasUIView: CanvasUIView?
 
     var body: some View {
-        CanvasHostView(
-                stickers: $stickers,
-                selectedStickerID: $selectedStickerID,
-                canvasScale: $canvasScale,
-                canvasOffset: $canvasOffset,
-                canvasBackground: canvasBackground,
-                canvasMode: canvasMode,
-                onTapEmpty: {
-                    selectedStickerID = nil
-                    if showLayersPanel {
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) { showLayersPanel = false }
-                    }
-                },
-                onTapSticker: { id in
-                    selectedStickerID = id
-                    bringToFront(stickerID: id)
-                    if showLayersPanel {
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) { showLayersPanel = false }
-                    }
-                },
-                onDragChanged: { screenPos in
-                    let screenHeight = UIScreen.main.bounds.height
-                    let nearBottom = screenPos.y > screenHeight - 220
-                    let inZone = screenPos.y > screenHeight - 130
-                    withAnimation(.spring(duration: 0.25)) {
-                        showTrashZone = nearBottom
-                        trashIsTargeted = inZone
-                    }
-                },
-                onDragEnded: { screenPos, stickerID in
-                    let screenHeight = UIScreen.main.bounds.height
-                    if screenPos.y > screenHeight - 130 {
-                        saveUndoState()
-                        withAnimation(.spring(duration: 0.2)) {
-                            stickers.removeAll { $0.id == stickerID }
-                            if selectedStickerID == stickerID { selectedStickerID = nil }
-                        }
-                    }
-                    withAnimation(.spring(duration: 0.3)) {
-                        showTrashZone = false
-                        trashIsTargeted = false
-                    }
-                },
-                onStickerGestureStart: {
-                    saveUndoState()
-                },
-                onTextEdit: { id in
-                    if let sticker = stickers.first(where: { $0.id == id }),
-                       case .text(let content) = sticker.kind {
-                        textEditorContent  = content
-                        textEditorTargetID = id
-                        withAnimation { showTextEditor = true }
-                    }
-                },
-                onViewReady: { view in canvasUIView = view }
-            )
-            .ignoresSafeArea()
-            .background(ShakeDetector())
-            .onReceive(NotificationCenter.default.publisher(for: .deviceDidShake)) { _ in
-                undo()
-            }
-            .overlay(alignment: .bottom) {
-                if showTrashZone && !coverPickerMode {
-                    trashZone
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
-            }
-            .overlay {
-                if coverPickerMode {
-                    coverPickerOverlay
-                }
-            }
+        canvasWithPickerSheets
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItemGroup(placement: .bottomBar) {
                     Spacer()
-                    if !coverPickerMode && !showTrashZone {
-                        Button {
-                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                            withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
-                                showCameraMenu = true
-                            }
-                        } label: {
-                            ZStack {
-                                // Rainbow glow ring
-                                Circle()
-                                    .stroke(
-                                        AngularGradient(
-                                            colors: [.red, .orange, .yellow, .green, .cyan, .blue, .purple, .pink, .red],
-                                            center: .center
-                                        ),
-                                        lineWidth: 4
-                                    )
-                                    .frame(width: 54, height: 54)
-                                    .blur(radius: 6)
-                                    .opacity(0.85)
-                                Circle()
-                                    .fill(Color.black)
-                                    .frame(width: 50, height: 50)
-                                Image(systemName: "camera.fill")
-                                    .font(.system(size: 20, weight: .semibold))
-                                    .foregroundStyle(.white)
-                            }
-                        }
-                        .buttonStyle(.plain)
-                    }
+                    if !coverPickerMode && !showTrashZone { cameraButton }
                     Spacer()
                 }
                 ToolbarItem(placement: .topBarLeading) {
                     Button {
                         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
-                            showLayersPanel.toggle()
-                        }
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) { showLayersPanel.toggle() }
                     } label: {
-                        Image(systemName: "square.3.layers.3d")
-                            .font(.system(size: 17, weight: .semibold))
+                        Image(systemName: "square.3.layers.3d").font(.system(size: 17, weight: .semibold))
                     }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
-                            showPlusMenu = true
-                        }
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) { showPlusMenu = true }
                     } label: {
-                        Image(systemName: "sparkle")
-                            .font(.system(size: 17, weight: .semibold))
+                        Image(systemName: "sparkle").font(.system(size: 17, weight: .semibold))
                     }
                 }
+                if isCollaborative && isOwner && !coverPickerMode {
+                    ToolbarItem(placement: .topBarTrailing) { inviteButton }
+                }
             }
+            .sheet(isPresented: Binding(
+                get: { pendingInviteToken != nil },
+                set: { if !$0 { pendingInviteToken = nil } }
+            )) {
+                if let token = pendingInviteToken {
+                    InviteShareSheet(token: token).presentationDetents([.height(320)])
+                }
+            }
+            .onAppear { Task { await startCanvas() } }
+            .onDisappear {
+                autosaveTask?.cancel()
+                autosaveTask = nil
+                if let session = collabSession {
+                    collabSession = nil
+                    Task { await session.end() }
+                }
+                saveCanvasLocalBackup()   // synchronous — survives app kill
+                saveCanvas()             // async Supabase upload
+            }
+            .onChange(of: stickers) { _, _ in
+                saveCanvasLocalBackup()  // immediate local safety net
+                scheduleAutosave()       // debounced Supabase write
+            }
+            .onChange(of: scenePhase) { _, phase in
+                // App going to background — flush to Supabase immediately
+                // because we may not get a chance to complete the debounced save.
+                if phase == .background {
+                    autosaveTask?.cancel()
+                    autosaveTask = nil
+                    saveCanvasLocalBackup()
+                    saveCanvas()
+                }
+            }
+            .alert("Tapestry Deleted", isPresented: $showTapestryDeletedAlert) {
+                Button("OK") { onDismiss?() }
+            } message: {
+                Text("The owner has deleted this tapestry.")
+            }
+    }
+
+    private var canvasWithPickerSheets: some View {
+        canvasContent
             .photosPicker(isPresented: $showPhotosPicker, selection: $selectedItem, matching: .images)
             .sheet(isPresented: $showMusicSearch) {
                 MusicSearchView(
-                    onSelect: { track in
-                        addMusicSticker(track: track)
-                        showMusicSearch = false
-                    },
+                    onSelect: { track in addMusicSticker(track: track); showMusicSearch = false },
                     onCancel: { showMusicSearch = false }
                 )
                 .presentationDetents([.medium, .large])
             }
-            .overlay {
-                if showPlusMenu {
-                    PlusMenuOverlay(
-                        onSelect: { item in
-                            showPlusMenu = false
-                            switch item {
-                            case .photo:      showPhotosPicker  = true
-                            case .text:
-                                textEditorContent  = nil
-                                textEditorTargetID = nil
-                                withAnimation { showTextEditor = true }
-                            case .background: showBackgroundSheet = true
-                            case .music:      showMusicSearch   = true
-                            case .video:      showVideoPicker   = true
-                            case .camera:     showCameraCapture = true
-                            }
-                        },
-                        onDismiss: { showPlusMenu = false }
-                    )
-                }
-            }
-            .overlay(alignment: .leading) {
-                if showLayersPanel {
-                    LayersPanelView(
-                        stickers: stickers,
-                        onSelect: { id in
-                            selectedStickerID = id
-                            bringToFront(stickerID: id)
-                        },
-                        onDismiss: {
-                            withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
-                                showLayersPanel = false
-                            }
-                        },
-                        onReorder: { orderedIDs in
-                            saveUndoState()
-                            for (position, id) in orderedIDs.enumerated() {
-                                if let idx = stickers.firstIndex(where: { $0.id == id }) {
-                                    stickers[idx].zIndex = Double(orderedIDs.count - position)
-                                }
-                            }
-                        }
-                    )
-                    .transition(.move(edge: .leading).combined(with: .opacity))
-                }
-            }
             .sheet(isPresented: $showVideoPicker) {
-                VideoPicker { url in
-                    pendingVideoURL = url
-                    showVideoPicker = false
-                }
+                VideoPicker { url in pendingVideoURL = url; showVideoPicker = false }
             }
             .fullScreenCover(isPresented: $showCameraCapture) {
                 CameraCapturePicker(
-                    onCapture: { image in
-                        showCameraCapture = false
-                        addStickerFromCapturedImage(image)
-                    },
+                    onCapture: { image in showCameraCapture = false; addStickerFromCapturedImage(image) },
                     onCancel: { showCameraCapture = false }
-                )
-                .ignoresSafeArea()
+                ).ignoresSafeArea()
             }
             .sheet(item: $pendingVideoURL) { url in
                 VideoProcessingView(
                     videoURL: url,
-                    onComplete: { result in
-                        pendingVideoURL = nil
-                        addVideoSticker(result: result)
-                    },
-                    onCancel: {
-                        pendingVideoURL = nil
-                    }
+                    onComplete: { result in pendingVideoURL = nil; addVideoSticker(result: result) },
+                    onCancel: { pendingVideoURL = nil }
                 )
             }
-            .overlay {
-                if showCameraMenu {
-                    CameraMenuOverlay(
-                        onSelect: { item in
-                            showCameraMenu = false
-                            switch item {
-                            case .photo:  showPhotosPicker  = true
-                            case .video:  showVideoPicker   = true
-                            case .camera: showCameraCapture = true
-                            default: break
-                            }
-                        },
-                        onDismiss: { showCameraMenu = false }
-                    )
-                }
-            }
+            .sheet(isPresented: $showBackgroundSheet) { backgroundSheet }
             .onChange(of: selectedItem) { _, newItem in
                 guard let newItem else { return }
                 Task { await addStickerFromImage(from: newItem) }
@@ -316,179 +198,448 @@ struct StickerCanvasView: View {
                 guard let newItem else { return }
                 Task { await loadBackgroundImage(from: newItem) }
             }
-            .overlay {
-                if showTextEditor {
-                    TextEditorOverlay(
-                        initialContent: textEditorContent,
-                        onComplete: { content in
-                            withAnimation { showTextEditor = false }
-                            if let targetID = textEditorTargetID,
-                               let idx = stickers.firstIndex(where: { $0.id == targetID }) {
-                                saveUndoState()
-                                stickers[idx].kind = .text(content)
-                                canvasUIView?.invalidateStickerCache()
-                            } else {
-                                saveUndoState()
-                                topZ += 1
-                                let sticker = Sticker(
-                                    kind: .text(content),
-                                    position: visibleCenter(),
-                                    scale: 1.0,
-                                    rotation: .zero,
-                                    zIndex: topZ
-                                )
-                                stickers.append(sticker)
-                                selectedStickerID = sticker.id
-                            }
-                            textEditorContent  = nil
-                            textEditorTargetID = nil
-                        },
-                        onCancel: {
-                            withAnimation { showTextEditor = false }
-                            textEditorContent  = nil
-                            textEditorTargetID = nil
-                        }
-                    )
-                    .transition(.opacity)
+            .overlay { if showPlusMenu { plusMenuOverlay } }
+            .overlay(alignment: .leading) { if showLayersPanel { layersPanelOverlay } }
+            .overlay { if showCameraMenu { cameraMenuOverlay } }
+            .overlay { if showTextEditor { textEditorOverlay } }
+    }
+
+    private var canvasContent: some View {
+        CanvasHostView(
+            stickers: $stickers,
+            selectedStickerID: $selectedStickerID,
+            canvasScale: $canvasScale,
+            canvasOffset: $canvasOffset,
+            canvasBackground: canvasBackground,
+            canvasMode: canvasMode,
+            onTapEmpty: {
+                selectedStickerID = nil
+                if showLayersPanel {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) { showLayersPanel = false }
+                }
+            },
+            onTapSticker: { id in
+                selectedStickerID = id
+                bringToFront(stickerID: id)
+                if showLayersPanel {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) { showLayersPanel = false }
+                }
+            },
+            onDragChanged: { screenPos in
+                let h = UIScreen.main.bounds.height
+                withAnimation(.spring(duration: 0.25)) {
+                    showTrashZone   = screenPos.y > h - 220
+                    trashIsTargeted = screenPos.y > h - 130
+                }
+            },
+            onDragEnded: { screenPos, stickerID in
+                if screenPos.y > UIScreen.main.bounds.height - 130 {
+                    saveUndoState()
+                    withAnimation(.spring(duration: 0.2)) {
+                        stickers.removeAll { $0.id == stickerID }
+                        if selectedStickerID == stickerID { selectedStickerID = nil }
+                    }
+                    collabSession.map { $0.broadcast($0.opDelete(stickerID: stickerID)) }
+                } else if let session = collabSession,
+                          let s = stickers.first(where: { $0.id == stickerID }) {
+                    session.broadcast(session.opMove(stickerID: stickerID, x: s.position.x, y: s.position.y))
+                }
+                withAnimation(.spring(duration: 0.3)) { showTrashZone = false; trashIsTargeted = false }
+            },
+            onStickerGestureStart: { saveUndoState() },
+            onStickerGestureEnded: { id in broadcastGestureEnded(stickerID: id) },
+            onTextEdit: { id in
+                guard let sticker = stickers.first(where: { $0.id == id }),
+                      case .text(let content) = sticker.kind else { return }
+                textEditorContent = content
+                textEditorTargetID = id
+                withAnimation { showTextEditor = true }
+            },
+            onPhotoReplaced: { id, img in broadcastPhotoReplaced(stickerID: id, image: img) },
+            onViewReady: { view in canvasUIView = view }
+        )
+        .ignoresSafeArea()
+        .background(ShakeDetector())
+        .onReceive(NotificationCenter.default.publisher(for: .deviceDidShake)) { _ in undo() }
+        .overlay(alignment: .bottom) {
+            if showTrashZone && !coverPickerMode {
+                trashZone.transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .overlay { if coverPickerMode { coverPickerOverlay } }
+    }
+
+    private var cameraButton: some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) { showCameraMenu = true }
+        } label: {
+            ZStack {
+                Circle()
+                    .stroke(AngularGradient(colors: [.red, .orange, .yellow, .green, .cyan, .blue, .purple, .pink, .red], center: .center), lineWidth: 4)
+                    .frame(width: 54, height: 54).blur(radius: 6).opacity(0.85)
+                Circle().fill(Color.black).frame(width: 50, height: 50)
+                    .overlay(Circle().strokeBorder(.white.opacity(colorScheme == .dark ? 0.5 : 0), lineWidth: 1.5))
+                Image(systemName: "camera.fill").font(.system(size: 20, weight: .semibold)).foregroundStyle(.white)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var inviteButton: some View {
+        Button {
+            guard let uid = auth.userID, let tid = tapestryID else { return }
+            isGeneratingInvite = true
+            Task {
+                do {
+                    let token = try await InviteService.getOrCreateCode(tapestryID: tid, userID: uid)
+                    await MainActor.run { pendingInviteToken = token; isGeneratingInvite = false }
+                } catch {
+                    print("[Invite] getOrCreateCode failed: \(error)")
+                    await MainActor.run { inviteError = error.localizedDescription; isGeneratingInvite = false }
                 }
             }
-            .sheet(isPresented: $showBackgroundSheet) {
-                backgroundSheet
+        } label: {
+            if isGeneratingInvite {
+                ProgressView().tint(.primary).frame(width: 24, height: 24)
+            } else {
+                Image(systemName: "person.badge.plus").font(.system(size: 17, weight: .semibold))
             }
-            .onAppear  { DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { loadCanvas() } }
-            .onDisappear {
-                saveCanvas()
+        }
+        .disabled(isGeneratingInvite)
+        .alert("Couldn't generate invite", isPresented: Binding(
+            get: { inviteError != nil },
+            set: { if !$0 { inviteError = nil } }
+        )) {
+            Button("OK") { inviteError = nil }
+        } message: {
+            Text(inviteError ?? "")
+        }
+    }
+
+    private var plusMenuOverlay: some View {
+        PlusMenuOverlay(
+            onSelect: { item in
+                showPlusMenu = false
+                switch item {
+                case .photo:      showPhotosPicker   = true
+                case .text:       textEditorContent = nil; textEditorTargetID = nil; withAnimation { showTextEditor = true }
+                case .background: showBackgroundSheet = true
+                case .music:      showMusicSearch    = true
+                case .video:      showVideoPicker    = true
+                case .camera:     showCameraCapture  = true
+                }
+            },
+            onDismiss: { showPlusMenu = false }
+        )
+    }
+
+    private var cameraMenuOverlay: some View {
+        CameraMenuOverlay(
+            onSelect: { item in
+                showCameraMenu = false
+                switch item {
+                case .photo:  showPhotosPicker  = true
+                case .video:  showVideoPicker   = true
+                case .camera: showCameraCapture = true
+                default: break
+                }
+            },
+            onDismiss: { showCameraMenu = false }
+        )
+    }
+
+    private var layersPanelOverlay: some View {
+        LayersPanelView(
+            stickers: stickers,
+            onSelect: { id in selectedStickerID = id; bringToFront(stickerID: id) },
+            onDismiss: { withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) { showLayersPanel = false } },
+            onReorder: { orderedIDs in
+                saveUndoState()
+                for (position, id) in orderedIDs.enumerated() {
+                    if let idx = stickers.firstIndex(where: { $0.id == id }) {
+                        let z = Double(orderedIDs.count - position)
+                        stickers[idx].zIndex = z
+                        collabSession.map { $0.broadcast($0.opReorder(stickerID: id, zIndex: z)) }
+                    }
+                }
             }
+        )
+        .transition(.move(edge: .leading).combined(with: .opacity))
+    }
+
+    private var textEditorOverlay: some View {
+        TextEditorOverlay(
+            initialContent: textEditorContent,
+            onComplete: { content in
+                withAnimation { showTextEditor = false }
+                if let targetID = textEditorTargetID,
+                   let idx = stickers.firstIndex(where: { $0.id == targetID }) {
+                    saveUndoState()
+                    stickers[idx].kind = .text(content)
+                    canvasUIView?.invalidateStickerCache()
+                    collabSession.map { $0.broadcast($0.opUpdateText(stickerID: targetID, content: content)) }
+                } else {
+                    saveUndoState()
+                    topZ += 1
+                    let sticker = Sticker(kind: .text(content), position: visibleCenter(), scale: 1.0, rotation: .zero, zIndex: topZ)
+                    stickers.append(sticker)
+                    selectedStickerID = sticker.id
+                    if let session = collabSession {
+                        var state = StickerState(id: sticker.id, type: "text",
+                            x: sticker.position.x, y: sticker.position.y, scale: 1.0, rotationRadians: 0, zIndex: sticker.zIndex)
+                        state.textString = content.text; state.fontIndex = content.fontIndex
+                        state.colorIndex = content.colorIndex; state.textWrapWidth = Double(content.wrapWidth)
+                        state.textAlignment = content.alignment; state.textBGStyle = content.bgStyle
+                        session.broadcast(session.opAdd(sticker: state))
+                    }
+                }
+                textEditorContent = nil; textEditorTargetID = nil
+            },
+            onCancel: {
+                withAnimation { showTextEditor = false }
+                textEditorContent = nil; textEditorTargetID = nil
+            }
+        )
+        .transition(.opacity)
     }
 
     // MARK: - Canvas Persistence
 
-    private func loadCanvas() {
-        guard let json = initialCanvasData,
-              let data = json.data(using: .utf8),
-              let state = try? JSONDecoder().decode(CanvasState.self, from: data) else { return }
+    private func startCanvas() async {
+        try? await Task.sleep(for: .milliseconds(50))
+        await loadCanvas()
+        guard isCollaborative, let tid = tapestryID, let uid = store.currentUserID else { return }
+        let session = TapestryCollabSession(tapestryID: tid, senderID: uid)
+        collabSession = session
+        session.onOpReceived = { op in applyRemoteOp(op) }
+        session.onTapestryDeleted = { showTapestryDeletedAlert = true }
+        await session.start()
+    }
 
-        // Background
+    private func scheduleAutosave() {
+        guard canvasLoaded, tapestryID != nil, !coverPickerMode else { return }
+        // During collab, only the owner autosaves. Members rely on per-op broadcasts
+        // for live sync — having multiple writers causes race conditions where one
+        // user's snapshot overwrites another's. The owner is the single source of
+        // truth for canvas_data; their save survives even if the app is force-killed.
+        if collabSession != nil && !isOwner { return }
+        autosaveTask?.cancel()
+        autosaveTask = Task {
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+            saveCanvas()
+        }
+    }
+
+    // MARK: - Local backup helpers
+
+    private func localBackupURL(for tid: UUID) -> URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("\(tid.uuidString)_canvas.json")
+    }
+
+    /// Writes the canvas layout to a local JSON file immediately (synchronous, no uploads).
+    /// Acts as a safety net against app kills before the debounced Supabase write completes.
+    private func saveCanvasLocalBackup() {
+        guard let tid = tapestryID, canvasLoaded, !coverPickerMode else { return }
+        if collabSession != nil && !isOwner { return }
+
+        var bgState = CanvasState.BackgroundState(type: "color")
+        switch canvasBackground {
+        case .color(let c):
+            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+            c.getRed(&r, green: &g, blue: &b, alpha: &a)
+            bgState.colorComponents = [r, g, b, a].map { Double($0) }
+        case .image:
+            bgState.type = "image"
+            // imageURL will be set on a successful Supabase write; for now we rely
+            // on the local file fallback that was saved when the image was added.
+        }
+
+        let stickerStates: [StickerState] = stickers.map { sticker in
+            var s = StickerState(id: sticker.id, type: "", x: sticker.position.x, y: sticker.position.y,
+                                 scale: sticker.scale, rotationRadians: sticker.rotation.radians, zIndex: sticker.zIndex)
+            switch sticker.kind {
+            case .photo(let img):
+                s.type = "photo"
+                s.imageFilename = img.images != nil ? "\(sticker.id.uuidString).gif" : "\(sticker.id.uuidString).png"
+                s.imageURL = uploadedURLs[sticker.id]
+            case .text(let c):
+                s.type = "text"; s.textString = c.text; s.fontIndex = c.fontIndex
+                s.colorIndex = c.colorIndex; s.textWrapWidth = Double(c.wrapWidth)
+                s.textAlignment = c.alignment; s.textBGStyle = c.bgStyle
+            case .music(let t):
+                s.type = "music"; s.musicID = t.id; s.musicTitle = t.title
+                s.musicArtist = t.artistName
+                s.musicArtworkURLString = t.artworkURL?.absoluteString
+                s.musicPreviewURLString = t.previewURL?.absoluteString
+            case .video(_, _, let bgRemoved):
+                s.type = "video"; s.bgRemoved = bgRemoved
+                s.videoURL = uploadedURLs[sticker.id]
+            }
+            return s
+        }
+
+        guard let data = try? JSONEncoder().encode(CanvasState(background: bgState, stickers: stickerStates)) else { return }
+        try? data.write(to: localBackupURL(for: tid))
+    }
+
+    private func loadCanvas() async {
+        // Pick the best source: prefer whichever of (Supabase, local backup) has more stickers.
+        // This ensures edits survive app kills before the Supabase write completes.
+        var sourceJSON: String? = initialCanvasData
+        if let tid = tapestryID {
+            let backupURL = localBackupURL(for: tid)
+            if let backupData = try? Data(contentsOf: backupURL) {
+                if let remoteJSON = sourceJSON,
+                   let remoteData = remoteJSON.data(using: .utf8),
+                   let remoteState = try? JSONDecoder().decode(CanvasState.self, from: remoteData),
+                   let localState  = try? JSONDecoder().decode(CanvasState.self, from: backupData) {
+                    // Prefer local backup when it has more stickers (Supabase missed recent edits)
+                    if localState.stickers.count > remoteState.stickers.count {
+                        sourceJSON = String(data: backupData, encoding: .utf8)
+                    }
+                } else if sourceJSON == nil {
+                    // No remote data at all — use local backup unconditionally
+                    sourceJSON = String(data: backupData, encoding: .utf8)
+                }
+            }
+        }
+
+        guard let json = sourceJSON,
+              let data = json.data(using: .utf8),
+              let state = try? JSONDecoder().decode(CanvasState.self, from: data) else {
+            await MainActor.run { canvasLoaded = true }
+            return
+        }
+
         switch state.background.type {
         case "image":
-            if let fn = state.background.imageFilename,
-               let img = StickerStorage.loadImage(filename: fn) {
-                canvasBackground = .image(img)
+            if let urlString = state.background.imageURL,
+               let localURL = try? await StickerAssetUploader.cachedLocalURL(for: urlString, ext: "png"),
+               let img = UIImage(contentsOfFile: localURL.path) {
+                await MainActor.run { canvasBackground = .image(img) }
             }
         default:
             if let c = state.background.colorComponents, c.count == 4 {
-                canvasBackground = .color(UIColor(red: c[0], green: c[1], blue: c[2], alpha: c[3]))
+                await MainActor.run {
+                    canvasBackground = .color(UIColor(red: c[0], green: c[1], blue: c[2], alpha: c[3]))
+                }
             }
         }
 
-        // Stickers
         var loaded: [Sticker] = []
-        for s in state.stickers {
-            let pos = CGPoint(x: s.x, y: s.y)
-            let rot = Angle(radians: s.rotationRadians)
-            switch s.type {
-            case "photo":
-                if let fn = s.imageFilename, let img = StickerStorage.loadImage(filename: fn) {
-                    loaded.append(Sticker(id: s.id, kind: .photo(img), position: pos, scale: s.scale, rotation: rot, zIndex: s.zIndex))
-                }
-            case "text":
-                if let text = s.textString, let fi = s.fontIndex, let ci = s.colorIndex {
-                    let wrapWidth = s.textWrapWidth.map { CGFloat($0) } ?? 900
-                    let alignment = s.textAlignment ?? 1
-                    let bgStyle   = s.textBGStyle   ?? 1
-                    let content = TextStickerContent(text: text, fontIndex: fi, colorIndex: ci,
-                                                     wrapWidth: wrapWidth, alignment: alignment, bgStyle: bgStyle)
-                    loaded.append(Sticker(id: s.id, kind: .text(content), position: pos, scale: s.scale, rotation: rot, zIndex: s.zIndex))
-                }
-            case "music":
-                if let mid = s.musicID, let title = s.musicTitle, let artist = s.musicArtist {
-                    var track = MusicTrack(
-                        id: mid, title: title, artistName: artist,
-                        artworkURL: s.musicArtworkURLString.flatMap { URL(string: $0) },
-                        previewURL: s.musicPreviewURLString.flatMap { URL(string: $0) }
-                    )
-                    // Restore cached artwork — no network call needed
-                    if let artFn = s.musicArtworkImageFilename {
-                        track.artworkImage = StickerStorage.loadImage(filename: artFn)
+        await withTaskGroup(of: Sticker?.self) { group in
+            for s in state.stickers {
+                group.addTask {
+                    let pos = CGPoint(x: s.x, y: s.y)
+                    let rot = Angle(radians: s.rotationRadians)
+                    switch s.type {
+                    case "photo":
+                        // Try Supabase URL first; fall back to local file if URL is
+                        // missing (upload was interrupted) or the download fails.
+                        let img: UIImage?
+                        if let urlString = s.imageURL,
+                           let localURL = try? await StickerAssetUploader.cachedLocalURL(for: urlString, ext: urlString.hasSuffix(".gif") ? "gif" : "png") {
+                            let ext = urlString.hasSuffix(".gif") ? "gif" : "png"
+                            img = ext == "gif" ? UIImage.animatedGIF(from: localURL) : UIImage(contentsOfFile: localURL.path)
+                            if img != nil { await MainActor.run { uploadedURLs[s.id] = urlString } }
+                        } else if let fn = s.imageFilename {
+                            img = StickerStorage.loadImage(filename: fn)
+                        } else {
+                            img = nil
+                        }
+                        guard let img else { return nil }
+                        return Sticker(id: s.id, kind: .photo(img), position: pos, scale: s.scale, rotation: rot, zIndex: s.zIndex)
+                    case "text":
+                        guard let text = s.textString, let fi = s.fontIndex, let ci = s.colorIndex else { return nil }
+                        let content = TextStickerContent(text: text, fontIndex: fi, colorIndex: ci,
+                            wrapWidth: s.textWrapWidth.map { CGFloat($0) } ?? 900,
+                            alignment: s.textAlignment ?? 1, bgStyle: s.textBGStyle ?? 1)
+                        return Sticker(id: s.id, kind: .text(content), position: pos, scale: s.scale, rotation: rot, zIndex: s.zIndex)
+                    case "music":
+                        guard let mid = s.musicID, let title = s.musicTitle, let artist = s.musicArtist else { return nil }
+                        let track = MusicTrack(id: mid, title: title, artistName: artist,
+                            artworkURL: s.musicArtworkURLString.flatMap { URL(string: $0) },
+                            previewURL: s.musicPreviewURLString.flatMap { URL(string: $0) })
+                        return Sticker(id: s.id, kind: .music(track), position: pos, scale: s.scale, rotation: rot, zIndex: s.zIndex)
+                    case "video":
+                        guard let vURL = s.videoURL, let tURL = s.videoThumbnailURL,
+                              let localVideoURL = try? await StickerAssetUploader.cachedLocalURL(for: vURL, ext: "mp4"),
+                              let localThumbURL = try? await StickerAssetUploader.cachedLocalURL(for: tURL, ext: "png"),
+                              let thumb = UIImage(contentsOfFile: localThumbURL.path) else { return nil }
+                        await MainActor.run { uploadedURLs[s.id] = vURL }
+                        return Sticker(id: s.id, kind: .video(videoURL: localVideoURL, thumbnail: thumb, bgRemoved: s.bgRemoved ?? false), position: pos, scale: s.scale, rotation: rot, zIndex: s.zIndex)
+                    default: return nil
                     }
-                    loaded.append(Sticker(id: s.id, kind: .music(track), position: pos, scale: s.scale, rotation: rot, zIndex: s.zIndex))
                 }
-            case "video":
-                if let vfn = s.videoFilename,
-                   let videoURL = StickerStorage.loadVideoURL(filename: vfn),
-                   let tfn = s.videoThumbnailFilename,
-                   let thumb = StickerStorage.loadImage(filename: tfn) {
-                    loaded.append(Sticker(id: s.id, kind: .video(videoURL: videoURL, thumbnail: thumb, bgRemoved: s.bgRemoved ?? false), position: pos, scale: s.scale, rotation: rot, zIndex: s.zIndex))
+            }
+            for await sticker in group { if let sticker { loaded.append(sticker) } }
+        }
+
+        loaded.sort { $0.zIndex < $1.zIndex }
+        await MainActor.run {
+            stickers = loaded
+            topZ = loaded.map { $0.zIndex }.max() ?? 0
+            canvasLoaded = true
+        }
+
+        // Artwork images are not persisted — re-fetch from artworkURL for every music sticker.
+        for sticker in loaded {
+            guard case .music(let track) = sticker.kind, let artURL = track.artworkURL else { continue }
+            let sid = sticker.id
+            Task {
+                guard let (data, _) = try? await URLSession.shared.data(from: artURL),
+                      let img = UIImage(data: data) else { return }
+                if let idx = stickers.firstIndex(where: { $0.id == sid }),
+                   case .music(var t) = stickers[idx].kind {
+                    t.artworkImage = img
+                    stickers[idx].kind = .music(t)
                 }
-            default: break
             }
         }
-        stickers = loaded
-        topZ = loaded.map { $0.zIndex }.max() ?? 0
     }
 
     private func saveCanvas() {
-        // Cover-picker mode is read-only; skip entirely.
         guard let tid = tapestryID, !coverPickerMode else { return }
-
-        // Snapshot value types so the background task owns its own copies
         let stickerSnapshot    = stickers
         let backgroundSnapshot = canvasBackground
+        let urlCacheSnapshot   = uploadedURLs
+
+        let hasMediaStickers = stickerSnapshot.contains {
+            switch $0.kind { case .photo, .video: return true; default: return false }
+        }
+        if !hasMediaStickers {
+            var immediateBG = CanvasState.BackgroundState(type: "color")
+            if case .color(let c) = backgroundSnapshot {
+                var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+                c.getRed(&r, green: &g, blue: &b, alpha: &a)
+                immediateBG.colorComponents = [r, g, b, a].map { Double($0) }
+            }
+            let immediateStates: [StickerState] = stickerSnapshot.compactMap { sticker in
+                var s = StickerState(id: sticker.id, type: "", x: sticker.position.x, y: sticker.position.y,
+                                     scale: sticker.scale, rotationRadians: sticker.rotation.radians, zIndex: sticker.zIndex)
+                switch sticker.kind {
+                case .text(let c):
+                    s.type = "text"; s.textString = c.text; s.fontIndex = c.fontIndex
+                    s.colorIndex = c.colorIndex; s.textWrapWidth = Double(c.wrapWidth)
+                    s.textAlignment = c.alignment; s.textBGStyle = c.bgStyle; return s
+                case .music(let t):
+                    s.type = "music"; s.musicID = t.id; s.musicTitle = t.title
+                    s.musicArtist = t.artistName
+                    s.musicArtworkURLString = t.artworkURL?.absoluteString
+                    s.musicPreviewURLString = t.previewURL?.absoluteString; return s
+                default: return nil
+                }
+            }
+            if let data = try? JSONEncoder().encode(CanvasState(background: immediateBG, stickers: immediateStates)),
+               let json = String(data: data, encoding: .utf8) {
+                store.updateCanvas(tapestryID: tid, canvasJSON: json)
+            }
+        }
 
         Task(priority: .utility) { [store] in
-            var stickerStates: [StickerState] = []
-            for sticker in stickerSnapshot {
-                var s = StickerState(
-                    id: sticker.id, type: "",
-                    x: sticker.position.x, y: sticker.position.y,
-                    scale: sticker.scale,
-                    rotationRadians: sticker.rotation.radians,
-                    zIndex: sticker.zIndex
-                )
-                switch sticker.kind {
-                case .photo(let img):
-                    s.type = "photo"
-                    if img.images != nil {
-                        s.imageFilename = "\(sticker.id.uuidString).gif"
-                    } else {
-                        let fn = "\(sticker.id.uuidString).png"
-                        StickerStorage.saveImage(img, filename: fn)
-                        s.imageFilename = fn
-                    }
-                case .text(let content):
-                    s.type          = "text"
-                    s.textString    = content.text
-                    s.fontIndex     = content.fontIndex
-                    s.colorIndex    = content.colorIndex
-                    s.textWrapWidth = Double(content.wrapWidth)
-                    s.textAlignment = content.alignment
-                    s.textBGStyle   = content.bgStyle
-                case .music(let track):
-                    s.type = "music"
-                    s.musicID               = track.id
-                    s.musicTitle            = track.title
-                    s.musicArtist           = track.artistName
-                    s.musicArtworkURLString = track.artworkURL?.absoluteString
-                    s.musicPreviewURLString = track.previewURL?.absoluteString
-                    if let artImg = track.artworkImage {
-                        let artFn = "\(sticker.id.uuidString)_art.png"
-                        StickerStorage.saveImage(artImg, filename: artFn)
-                        s.musicArtworkImageFilename = artFn
-                    }
-                case .video(let url, let thumb, let bgRemoved):
-                    s.type = "video"
-                    let vfn = "\(sticker.id.uuidString).mp4"
-                    let tfn = "\(sticker.id.uuidString)_thumb.png"
-                    StickerStorage.saveVideo(from: url, filename: vfn)
-                    StickerStorage.saveImage(thumb, filename: tfn)
-                    s.videoFilename          = vfn
-                    s.videoThumbnailFilename = tfn
-                    s.bgRemoved              = bgRemoved
-                }
-                stickerStates.append(s)
-            }
-
-            // Background state
             var bgState = CanvasState.BackgroundState(type: "color")
             switch backgroundSnapshot {
             case .color(let c):
@@ -498,18 +649,210 @@ struct StickerCanvasView: View {
                 bgState.colorComponents = [r, g, b, a].map { Double($0) }
             case .image(let img):
                 bgState.type = "image"
-                let fn = "\(tid.uuidString)_bg.png"
-                StickerStorage.saveImage(img, filename: fn)
-                bgState.imageFilename = fn
+                bgState.imageURL = try? await StickerAssetUploader.uploadBackground(img, tapestryID: tid)
             }
 
-            guard let data = try? JSONEncoder().encode(CanvasState(background: bgState, stickers: stickerStates)),
-                  let json = String(data: data, encoding: .utf8) else { return }
-
-            await MainActor.run { store.updateCanvas(tapestryID: tid, canvasJSON: json) }
+            var stickerStates: [StickerState] = []
+            for sticker in stickerSnapshot {
+                var s = StickerState(id: sticker.id, type: "", x: sticker.position.x, y: sticker.position.y,
+                                     scale: sticker.scale, rotationRadians: sticker.rotation.radians, zIndex: sticker.zIndex)
+                switch sticker.kind {
+                case .photo(let img):
+                    s.type = "photo"
+                    // Always record the local filename so photos survive even if the
+                    // Supabase upload is interrupted (e.g. app backgrounded on close).
+                    s.imageFilename = img.images != nil
+                        ? "\(sticker.id.uuidString).gif"
+                        : "\(sticker.id.uuidString).png"
+                    if let cached = urlCacheSnapshot[sticker.id] {
+                        s.imageURL = cached
+                    } else {
+                        let url: String?
+                        if img.images != nil {
+                            url = try? await StickerAssetUploader.uploadGIF(stickerID: sticker.id)
+                        } else {
+                            url = try? await StickerAssetUploader.uploadImage(img, stickerID: sticker.id)
+                        }
+                        s.imageURL = url
+                        if let url = url { await MainActor.run { uploadedURLs[sticker.id] = url } }
+                    }
+                case .text(let c):
+                    s.type = "text"; s.textString = c.text; s.fontIndex = c.fontIndex
+                    s.colorIndex = c.colorIndex; s.textWrapWidth = Double(c.wrapWidth)
+                    s.textAlignment = c.alignment; s.textBGStyle = c.bgStyle
+                case .music(let t):
+                    s.type = "music"; s.musicID = t.id; s.musicTitle = t.title
+                    s.musicArtist = t.artistName
+                    s.musicArtworkURLString = t.artworkURL?.absoluteString
+                    s.musicPreviewURLString = t.previewURL?.absoluteString
+                case .video(let url, let thumb, let bgRemoved):
+                    s.type = "video"; s.bgRemoved = bgRemoved
+                    if let cached = urlCacheSnapshot[sticker.id] {
+                        s.videoURL = cached
+                        s.videoThumbnailURL = try? await StickerAssetUploader.uploadVideoThumbnail(thumb, stickerID: sticker.id)
+                    } else {
+                        s.videoURL = try? await StickerAssetUploader.uploadVideo(from: url, stickerID: sticker.id)
+                        s.videoThumbnailURL = try? await StickerAssetUploader.uploadVideoThumbnail(thumb, stickerID: sticker.id)
+                        if let vURL = s.videoURL { await MainActor.run { uploadedURLs[sticker.id] = vURL } }
+                    }
+                }
+                stickerStates.append(s)
+                if let data = try? JSONEncoder().encode(CanvasState(background: bgState, stickers: stickerStates)),
+                   let json = String(data: data, encoding: .utf8) {
+                    await MainActor.run { store.updateCanvas(tapestryID: tid, canvasJSON: json) }
+                }
+            }
         }
     }
 
+    // MARK: - Collab: Apply Remote Ops
+
+    private func applyRemoteOp(_ op: StickerOp) {
+        switch op.type {
+        case .move:
+            guard let x = op.x, let y = op.y, let i = stickers.firstIndex(where: { $0.id == op.stickerID }) else { return }
+            stickers[i].position = CGPoint(x: x, y: y)
+        case .scale:
+            guard let scale = op.scale, let i = stickers.firstIndex(where: { $0.id == op.stickerID }) else { return }
+            stickers[i].scale = scale
+        case .rotate:
+            guard let radians = op.rotationRadians, let i = stickers.firstIndex(where: { $0.id == op.stickerID }) else { return }
+            stickers[i].rotation = Angle(radians: radians)
+        case .add:
+            guard let state = op.sticker, !stickers.contains(where: { $0.id == op.stickerID }) else { return }
+            Task { await applyRemoteAdd(state) }
+        case .delete:
+            withAnimation(.spring(duration: 0.2)) {
+                stickers.removeAll { $0.id == op.stickerID }
+                if selectedStickerID == op.stickerID { selectedStickerID = nil }
+            }
+        case .reorder:
+            guard let zIndex = op.zIndex, let i = stickers.firstIndex(where: { $0.id == op.stickerID }) else { return }
+            stickers[i].zIndex = zIndex
+        case .updateText:
+            guard let text = op.textString, let fi = op.fontIndex, let ci = op.colorIndex,
+                  let i = stickers.firstIndex(where: { $0.id == op.stickerID }) else { return }
+            let content = TextStickerContent(text: text, fontIndex: fi, colorIndex: ci,
+                wrapWidth: op.textWrapWidth.map { CGFloat($0) } ?? 900,
+                alignment: op.textAlignment ?? 1, bgStyle: op.textBGStyle ?? 1)
+            stickers[i].kind = .text(content)
+            canvasUIView?.invalidateStickerCache()
+        case .updatePhoto:
+            guard let urlString = op.imageURL, let i = stickers.firstIndex(where: { $0.id == op.stickerID }) else { return }
+            Task {
+                let ext = urlString.hasSuffix(".gif") ? "gif" : "png"
+                guard let localURL = try? await StickerAssetUploader.cachedLocalURL(for: urlString, ext: ext),
+                      let img = UIImage(contentsOfFile: localURL.path) else { return }
+                uploadedURLs[op.stickerID] = urlString
+                stickers[i].kind = .photo(img)
+                canvasUIView?.invalidateStickerCache()
+            }
+        case .updateBackground:
+            if let comps = op.bgColorComponents, comps.count == 4 {
+                canvasBackground = .color(UIColor(red: comps[0], green: comps[1], blue: comps[2], alpha: comps[3]))
+            } else if let urlString = op.imageURL {
+                Task {
+                    guard let localURL = try? await StickerAssetUploader.cachedLocalURL(for: urlString, ext: "jpg"),
+                          let img = UIImage(contentsOfFile: localURL.path) else { return }
+                    await MainActor.run { canvasBackground = .image(img) }
+                }
+            }
+        }
+    }
+
+    private func applyRemoteAdd(_ state: StickerState) async {
+        let pos = CGPoint(x: state.x, y: state.y)
+        let rot = Angle(radians: state.rotationRadians)
+        switch state.type {
+        case "photo":
+            guard let urlString = state.imageURL else { return }
+            let ext = urlString.hasSuffix(".gif") ? "gif" : "png"
+            guard let localURL = try? await StickerAssetUploader.cachedLocalURL(for: urlString, ext: ext) else { return }
+            let img = ext == "gif" ? UIImage.animatedGIF(from: localURL) : UIImage(contentsOfFile: localURL.path)
+            guard let img else { return }
+            await MainActor.run {
+                uploadedURLs[state.id] = urlString
+                stickers.append(Sticker(id: state.id, kind: .photo(img), position: pos, scale: state.scale, rotation: rot, zIndex: state.zIndex))
+            }
+        case "text":
+            guard let text = state.textString, let fi = state.fontIndex, let ci = state.colorIndex else { return }
+            let content = TextStickerContent(text: text, fontIndex: fi, colorIndex: ci,
+                wrapWidth: state.textWrapWidth.map { CGFloat($0) } ?? 900,
+                alignment: state.textAlignment ?? 1, bgStyle: state.textBGStyle ?? 1)
+            await MainActor.run {
+                stickers.append(Sticker(id: state.id, kind: .text(content), position: pos, scale: state.scale, rotation: rot, zIndex: state.zIndex))
+            }
+        case "music":
+            guard let mid = state.musicID, let title = state.musicTitle, let artist = state.musicArtist else { return }
+            let track = MusicTrack(id: mid, title: title, artistName: artist,
+                artworkURL: state.musicArtworkURLString.flatMap { URL(string: $0) },
+                previewURL: state.musicPreviewURLString.flatMap { URL(string: $0) })
+            let sid = state.id
+            await MainActor.run {
+                stickers.append(Sticker(id: sid, kind: .music(track), position: pos, scale: state.scale, rotation: rot, zIndex: state.zIndex))
+            }
+            if let artURL = track.artworkURL {
+                Task {
+                    guard let (data, _) = try? await URLSession.shared.data(from: artURL),
+                          let img = UIImage(data: data) else { return }
+                    if let idx = stickers.firstIndex(where: { $0.id == sid }),
+                       case .music(var t) = stickers[idx].kind {
+                        t.artworkImage = img
+                        stickers[idx].kind = .music(t)
+                    }
+                }
+            }
+        case "video":
+            guard let vURL = state.videoURL, let tURL = state.videoThumbnailURL,
+                  let localVideoURL = try? await StickerAssetUploader.cachedLocalURL(for: vURL, ext: "mp4"),
+                  let localThumbURL = try? await StickerAssetUploader.cachedLocalURL(for: tURL, ext: "png"),
+                  let thumb = UIImage(contentsOfFile: localThumbURL.path) else { return }
+            await MainActor.run {
+                uploadedURLs[state.id] = vURL
+                stickers.append(Sticker(id: state.id, kind: .video(videoURL: localVideoURL, thumbnail: thumb, bgRemoved: state.bgRemoved ?? false), position: pos, scale: state.scale, rotation: rot, zIndex: state.zIndex))
+            }
+        default: break
+        }
+    }
+
+
+    // MARK: - Collab: Broadcast Gesture End
+
+    private func broadcastGestureEnded(stickerID: UUID) {
+        guard let session = collabSession,
+              let s = stickers.first(where: { $0.id == stickerID }) else { return }
+        session.broadcast(session.opScale(stickerID: stickerID, scale: s.scale))
+        session.broadcast(session.opRotate(stickerID: stickerID, radians: s.rotation.radians))
+    }
+
+    private func broadcastPhotoReplaced(stickerID: UUID, image: UIImage) {
+        // Save the background-removed image to disk immediately, overwriting the original.
+        // This ensures the local fallback (imageFilename) is always up-to-date even if
+        // the Supabase upload hasn't completed yet (e.g. app killed right after removal).
+        let fn = "\(stickerID.uuidString).png"
+        Task.detached(priority: .utility) { StickerStorage.saveImage(image, filename: fn) }
+
+        // Clear the stale URL immediately so saveCanvas() cannot snapshot an old
+        // original-photo URL before the new cutout upload finishes.  This is the key
+        // fix for the group-tapestry revert bug: for group tapestries the photo is
+        // uploaded eagerly on add, so uploadedURLs[stickerID] holds the original URL
+        // right up until this point.  Without the clear, a saveCanvas() triggered by
+        // onChange(stickers) could snapshot that stale URL and persist it to canvas_data,
+        // causing the cutout to revert to the original on next load.
+        uploadedURLs.removeValue(forKey: stickerID)
+
+        Task(priority: .utility) {
+            // Use a fresh UUID as the storage path so the URL changes after background
+            // removal. Reusing stickerID keeps the same path, and the receiver finds the
+            // stale original in its local cache and never re-downloads the cutout.
+            let uploadID = UUID()
+            guard let url = try? await StickerAssetUploader.uploadImage(image, stickerID: uploadID) else { return }
+            await MainActor.run {
+                uploadedURLs[stickerID] = url
+                collabSession.map { $0.broadcast($0.opUpdatePhoto(stickerID: stickerID, imageURL: url)) }
+            }
+        }
+    }
 
     // MARK: - Background Sheet
 
@@ -523,7 +866,13 @@ struct StickerCanvasView: View {
                     ColorPicker("Background color", selection: $selectedColor, supportsOpacity: false)
                         .labelsHidden()
                         .onChange(of: selectedColor) { _, newColor in
-                            canvasBackground = .color(UIColor(newColor))
+                            let uiColor = UIColor(newColor)
+                            canvasBackground = .color(uiColor)
+                            if let session = collabSession {
+                                var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+                                uiColor.getRed(&r, green: &g, blue: &b, alpha: &a)
+                                session.broadcast(session.opUpdateBackground(colorComponents: [r, g, b, a]))
+                            }
                         }
 
                     // Quick preset swatches
@@ -536,6 +885,11 @@ struct StickerCanvasView: View {
                                 .onTapGesture {
                                     selectedColor = Color(uiColor: color)
                                     canvasBackground = .color(color)
+                                    if let session = collabSession {
+                                        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+                                        color.getRed(&r, green: &g, blue: &b, alpha: &a)
+                                        session.broadcast(session.opUpdateBackground(colorComponents: [r, g, b, a]))
+                                    }
                                 }
                         }
                     }
@@ -759,6 +1113,10 @@ extension StickerCanvasView {
         } else {
             guard let img = UIImage(data: data)?.normalized() else { return }
             uiImage = img
+            // Save to disk immediately so saveCanvas can reference it locally if the
+            // Supabase upload is interrupted (e.g. app goes to background on close).
+            let fn = "\(stickerID.uuidString).png"
+            Task.detached(priority: .utility) { StickerStorage.saveImage(img, filename: fn) }
         }
 
         saveUndoState()
@@ -774,14 +1132,33 @@ extension StickerCanvasView {
         stickers.append(sticker)
         selectedStickerID = sticker.id
         selectedItem = nil
+
+        if let session = collabSession, tapestryID != nil {
+            let pos = sticker.position; let z = sticker.zIndex; let img = uiImage
+            Task(priority: .utility) {
+                let url: String?
+                if img.images != nil {
+                    url = try? await StickerAssetUploader.uploadGIF(stickerID: stickerID)
+                } else {
+                    url = try? await StickerAssetUploader.uploadImage(img, stickerID: stickerID)
+                }
+                guard let url else { return }
+                await MainActor.run { uploadedURLs[stickerID] = url }
+                var state = StickerState(id: stickerID, type: "photo",
+                    x: pos.x, y: pos.y, scale: 1.0, rotationRadians: 0, zIndex: z)
+                state.imageURL = url
+                session.broadcast(session.opAdd(sticker: state))
+            }
+        }
     }
 
     private func addStickerFromCapturedImage(_ image: UIImage) {
         let normalized = image.normalized()
+        let stickerID = UUID()
         saveUndoState()
         topZ += 1
         let sticker = Sticker(
-            id: UUID(),
+            id: stickerID,
             kind: .photo(normalized),
             position: visibleCenter(),
             scale: 1.0,
@@ -790,6 +1167,18 @@ extension StickerCanvasView {
         )
         stickers.append(sticker)
         selectedStickerID = sticker.id
+
+        if let session = collabSession {
+            let pos = sticker.position; let z = sticker.zIndex; let img = normalized
+            Task(priority: .utility) {
+                guard let url = try? await StickerAssetUploader.uploadImage(img, stickerID: stickerID) else { return }
+                await MainActor.run { uploadedURLs[stickerID] = url }
+                var state = StickerState(id: stickerID, type: "photo",
+                    x: pos.x, y: pos.y, scale: 1.0, rotationRadians: 0, zIndex: z)
+                state.imageURL = url
+                session.broadcast(session.opAdd(sticker: state))
+            }
+        }
     }
 
     private func addVideoSticker(result: VideoProcessor.Result) {
@@ -804,6 +1193,20 @@ extension StickerCanvasView {
         )
         stickers.append(sticker)
         selectedStickerID = sticker.id
+
+        if let session = collabSession {
+            let sid = sticker.id; let pos = sticker.position; let z = sticker.zIndex
+            let srcURL = result.outputURL; let thumb = result.thumbnail; let bgRemoved = result.bgRemoved
+            Task(priority: .utility) {
+                guard let vURL = try? await StickerAssetUploader.uploadVideo(from: srcURL, stickerID: sid),
+                      let tURL = try? await StickerAssetUploader.uploadVideoThumbnail(thumb, stickerID: sid) else { return }
+                await MainActor.run { uploadedURLs[sid] = vURL }
+                var state = StickerState(id: sid, type: "video",
+                    x: pos.x, y: pos.y, scale: 1.0, rotationRadians: 0, zIndex: z)
+                state.videoURL = vURL; state.videoThumbnailURL = tURL; state.bgRemoved = bgRemoved
+                session.broadcast(session.opAdd(sticker: state))
+            }
+        }
     }
 
 
@@ -819,6 +1222,16 @@ extension StickerCanvasView {
         )
         stickers.append(sticker)
         selectedStickerID = sticker.id
+
+        if let session = collabSession {
+            var state = StickerState(id: sticker.id, type: "music",
+                x: sticker.position.x, y: sticker.position.y, scale: 1.0, rotationRadians: 0, zIndex: sticker.zIndex)
+            state.musicID = track.id; state.musicTitle = track.title; state.musicArtist = track.artistName
+            state.musicArtworkURLString = track.artworkURL?.absoluteString
+            state.musicPreviewURLString = track.previewURL?.absoluteString
+            session.broadcast(session.opAdd(sticker: state))
+        }
+
         // Fetch artwork in background and update sticker
         Task {
             guard let artURL = track.artworkURL,
@@ -841,6 +1254,14 @@ extension StickerCanvasView {
         canvasBackground = .image(uiImage)
         bgPickerItem = nil
         showBackgroundSheet = false
+        if let session = collabSession {
+            let img = uiImage
+            Task(priority: .utility) {
+                let bgID = UUID()
+                guard let url = try? await StickerAssetUploader.uploadImage(img, stickerID: bgID) else { return }
+                session.broadcast(session.opUpdateBackground(imageURL: url))
+            }
+        }
     }
 
     private func saveUndoState() {
@@ -853,17 +1274,79 @@ extension StickerCanvasView {
             UINotificationFeedbackGenerator().notificationOccurred(.error)
             return
         }
+        let before = stickers
         withAnimation(.spring(duration: 0.25)) {
             stickers = snapshot.stickers
             topZ = snapshot.topZ
         }
         UINotificationFeedbackGenerator().notificationOccurred(.success)
+        broadcastUndoDiff(before: before, after: snapshot.stickers)
+    }
+
+    /// Diffs two canvas states and broadcasts the minimum set of ops to bring
+    /// remote collaborators to the post-undo state. Uses existing op types so
+    /// no protocol changes are needed.
+    private func broadcastUndoDiff(before: [Sticker], after: [Sticker]) {
+        guard let session = collabSession else { return }
+
+        let beforeIDs = Set(before.map { $0.id })
+        let afterIDs  = Set(after.map  { $0.id })
+
+        // Stickers removed by undo (were added before undo) → delete on remote
+        for s in before where !afterIDs.contains(s.id) {
+            session.broadcast(session.opDelete(stickerID: s.id))
+        }
+
+        // Stickers restored by undo (were deleted before undo) → re-add on remote
+        for s in after where !beforeIDs.contains(s.id) {
+            var state = StickerState(id: s.id, type: "", x: s.position.x, y: s.position.y,
+                                     scale: s.scale, rotationRadians: s.rotation.radians, zIndex: s.zIndex)
+            switch s.kind {
+            case .photo:
+                state.type = "photo"
+                state.imageURL      = uploadedURLs[s.id]
+                state.imageFilename = "\(s.id.uuidString).png"
+                guard state.imageURL != nil else { continue } // upload still in progress — skip
+            case .text(let c):
+                state.type = "text"; state.textString = c.text; state.fontIndex = c.fontIndex
+                state.colorIndex = c.colorIndex; state.textWrapWidth = Double(c.wrapWidth)
+                state.textAlignment = c.alignment; state.textBGStyle = c.bgStyle
+            case .music(let t):
+                state.type = "music"; state.musicID = t.id; state.musicTitle = t.title
+                state.musicArtist = t.artistName
+                state.musicArtworkURLString = t.artworkURL?.absoluteString
+                state.musicPreviewURLString = t.previewURL?.absoluteString
+            case .video:
+                state.type = "video"
+                state.videoURL = uploadedURLs[s.id]
+                guard state.videoURL != nil else { continue }
+            }
+            session.broadcast(session.opAdd(sticker: state))
+        }
+
+        // Stickers that changed position/scale/rotation/zIndex
+        for s in after where beforeIDs.contains(s.id) {
+            guard let old = before.first(where: { $0.id == s.id }) else { continue }
+            if s.position != old.position {
+                session.broadcast(session.opMove(stickerID: s.id, x: s.position.x, y: s.position.y))
+            }
+            if s.scale != old.scale {
+                session.broadcast(session.opScale(stickerID: s.id, scale: s.scale))
+            }
+            if s.rotation.radians != old.rotation.radians {
+                session.broadcast(session.opRotate(stickerID: s.id, radians: s.rotation.radians))
+            }
+            if s.zIndex != old.zIndex {
+                session.broadcast(session.opReorder(stickerID: s.id, zIndex: s.zIndex))
+            }
+        }
     }
 
     private func bringToFront(stickerID: UUID) {
         guard let idx = stickers.firstIndex(where: { $0.id == stickerID }) else { return }
         topZ += 1
         stickers[idx].zIndex = topZ
+        collabSession?.broadcast(collabSession!.opReorder(stickerID: stickerID, zIndex: topZ))
     }
 
     private func visibleCenter() -> CGPoint {
@@ -894,7 +1377,7 @@ enum StickerKind {
     case video(videoURL: URL, thumbnail: UIImage, bgRemoved: Bool = false)
 }
 
-struct Sticker: Identifiable {
+struct Sticker: Identifiable, Equatable {
     let id: UUID
     var kind: StickerKind
     var position: CGPoint
@@ -924,6 +1407,25 @@ struct Sticker: Identifiable {
         if case .music(let t) = kind { return t }
         return nil
     }
+
+    static func == (lhs: Sticker, rhs: Sticker) -> Bool {
+        guard lhs.id == rhs.id, lhs.position == rhs.position,
+              lhs.scale == rhs.scale, lhs.rotation == rhs.rotation,
+              lhs.zIndex == rhs.zIndex else { return false }
+        switch (lhs.kind, rhs.kind) {
+        case (.photo(let a), .photo(let b)):
+            return a === b   // UIImage is a class; pointer equality detects background removal
+        case (.video(let ua, let ta, let ba), .video(let ub, let tb, let bb)):
+            return ua == ub && ta === tb && ba == bb
+        case (.text(let a), .text(let b)):
+            return a.text == b.text && a.fontIndex == b.fontIndex &&
+                   a.colorIndex == b.colorIndex && a.wrapWidth == b.wrapWidth &&
+                   a.alignment == b.alignment && a.bgStyle == b.bgStyle
+        case (.music(let a), .music(let b)):
+            return a.id == b.id
+        default: return false
+        }
+    }
 }
 
 // MARK: - CanvasHostView
@@ -940,7 +1442,9 @@ struct CanvasHostView: UIViewRepresentable {
     let onDragChanged: (CGPoint) -> Void
     let onDragEnded: (CGPoint, UUID) -> Void
     let onStickerGestureStart: () -> Void
+    var onStickerGestureEnded: ((UUID) -> Void)? = nil
     let onTextEdit: (UUID) -> Void
+    var onPhotoReplaced: ((UUID, UIImage) -> Void)? = nil
     var onViewReady: ((CanvasUIView) -> Void)? = nil
 
     func makeCoordinator() -> CanvasCoordinator {
@@ -971,7 +1475,9 @@ struct CanvasHostView: UIViewRepresentable {
         context.coordinator.onDragChanged = onDragChanged
         context.coordinator.onDragEnded = onDragEnded
         context.coordinator.onStickerGestureStart = onStickerGestureStart
+        context.coordinator.onStickerGestureEnded = onStickerGestureEnded
         context.coordinator.onTextEdit = onTextEdit
+        context.coordinator.onPhotoReplaced = onPhotoReplaced
 
         view.syncBackground(canvasBackground)
 
@@ -996,18 +1502,66 @@ final class CanvasUIView: UIView {
     func renderViewportThumbnail(in captureRect: CGRect) -> UIImage? {
         let gridWasHidden = gridLayer.isHidden
         gridLayer.isHidden = true
+        defer { gridLayer.isHidden = gridWasHidden }
 
         let format = UIGraphicsImageRendererFormat()
         format.scale = UIScreen.main.scale
         format.opaque = true
         let renderer = UIGraphicsImageRenderer(size: captureRect.size, format: format)
-        let image = renderer.image { ctx in
-            ctx.cgContext.translateBy(x: -captureRect.origin.x, y: -captureRect.origin.y)
-            layer.render(in: ctx.cgContext)
+
+        // AVPlayerLayer is GPU-rendered and invisible to layer.render(in:).
+        // Snapshot each video sticker's current frame on the main thread now,
+        // along with its position/transform, so we can composite them manually.
+        struct VideoRenderInfo {
+            let centerInCanvas: CGPoint   // center in canvasView space
+            let centerInSelf: CGPoint     // center in CanvasUIView space (infinite canvas)
+            let transform: CGAffineTransform
+            let image: UIImage
+        }
+        let videoInfos: [VideoRenderInfo] = videoViews.compactMap { (_, vv) in
+            guard let image = vv.currentFrameImage() else { return nil }
+            return VideoRenderInfo(
+                centerInCanvas: vv.center,
+                centerInSelf: canvasView.convert(vv.center, to: self),
+                transform: vv.transform,
+                image: image
+            )
         }
 
-        gridLayer.isHidden = gridWasHidden
-        return image
+        let stickerSize = VideoStickerUIView.size
+
+        if isVertical {
+            let rectInCanvas = convert(captureRect, to: canvasView)
+            let scale = captureRect.width / rectInCanvas.width
+            return renderer.image { ctx in
+                ctx.cgContext.scaleBy(x: scale, y: scale)
+                ctx.cgContext.translateBy(x: -rectInCanvas.origin.x, y: -rectInCanvas.origin.y)
+                canvasView.layer.render(in: ctx.cgContext)
+                // Composite video frames — drawn in canvasView coordinate space
+                for info in videoInfos {
+                    ctx.cgContext.saveGState()
+                    ctx.cgContext.translateBy(x: info.centerInCanvas.x, y: info.centerInCanvas.y)
+                    ctx.cgContext.concatenate(info.transform)
+                    info.image.draw(in: CGRect(x: -stickerSize / 2, y: -stickerSize / 2,
+                                               width: stickerSize, height: stickerSize))
+                    ctx.cgContext.restoreGState()
+                }
+            }
+        }
+
+        return renderer.image { ctx in
+            ctx.cgContext.translateBy(x: -captureRect.origin.x, y: -captureRect.origin.y)
+            layer.render(in: ctx.cgContext)
+            // Composite video frames — drawn in CanvasUIView coordinate space
+            for info in videoInfos {
+                ctx.cgContext.saveGState()
+                ctx.cgContext.translateBy(x: info.centerInSelf.x, y: info.centerInSelf.y)
+                ctx.cgContext.concatenate(info.transform)
+                info.image.draw(in: CGRect(x: -stickerSize / 2, y: -stickerSize / 2,
+                                           width: stickerSize, height: stickerSize))
+                ctx.cgContext.restoreGState()
+            }
+        }
     }
 
     /// Renders the currently visible viewport to a UIImage at the given aspect ratio (width/height).
@@ -1073,6 +1627,10 @@ final class CanvasUIView: UIView {
             sv.showsHorizontalScrollIndicator = false
             sv.alwaysBounceVertical = true
             sv.contentSize = CGSize(width: w, height: h)
+            // Pinch-to-zoom: allow zooming in freely, slight zoom-out to get context
+            sv.minimumZoomScale = 0.6
+            sv.maximumZoomScale = 4.0
+            sv.delegate = self
             addSubview(sv)
             sv.addSubview(canvasView)
             scrollView = sv
@@ -1224,6 +1782,11 @@ final class CanvasUIView: UIView {
             lastSyncedStickers = nil
             coordinator?.stickers.wrappedValue[idx].kind = .photo(masked)
             UINotificationFeedbackGenerator().notificationOccurred(.success)
+            // Save masked image to disk immediately so it survives app restarts,
+            // and notify the canvas (broadcasts to collab peers + updates uploadedURLs).
+            let fn = "\(stickerID.uuidString).png"
+            Task.detached(priority: .utility) { StickerStorage.saveImage(masked, filename: fn) }
+            coordinator?.onPhotoReplaced?(stickerID, masked)
 
         } else if let vv = videoViews[stickerID] {
             let localPoints = points.map { vv.convert($0, from: self) }
@@ -1288,13 +1851,18 @@ final class CanvasUIView: UIView {
             guard a.id == b.id && a.position == b.position &&
                   a.scale == b.scale && a.rotation == b.rotation && a.zIndex == b.zIndex
             else { return false }
-            // Also detect text content changes (e.g. wrapWidth, font, color)
-            if case .text(let ta) = a.kind, case .text(let tb) = b.kind {
+            switch (a.kind, b.kind) {
+            case (.photo(let ia), .photo(let ib)):
+                return ia === ib   // pointer equality detects background removal
+            case (.text(let ta), .text(let tb)):
                 return ta.text == tb.text && ta.fontIndex == tb.fontIndex &&
                        ta.colorIndex == tb.colorIndex && ta.wrapWidth == tb.wrapWidth &&
                        ta.alignment == tb.alignment && ta.bgStyle == tb.bgStyle
+            case (.music(let ma), .music(let mb)):
+                return ma.artworkImage === mb.artworkImage
+            default:
+                return true
             }
-            return true
         }) } ?? false
         let selectionSame = lastSyncedSelection == selectedID
         guard !stickersSame || !selectionSame else { return }
@@ -1350,10 +1918,16 @@ final class CanvasUIView: UIView {
                     )
                     let sid = sticker.id
                     sc.onGestureStart = gestureStart
-                    sc.onGestureEnd = gestureEnd
+                    sc.onGestureEnd = { [weak coordinator, sid] in
+                        guard coordinator?.isLassoActive != true else { return }
+                        coordinator?.canvasPan?.isEnabled = true
+                        coordinator?.canvasPinch?.isEnabled = true
+                        coordinator?.onStickerGestureEnded?(sid)
+                    }
                     sc.onDragChanged = { [weak coordinator] p in coordinator?.onDragChanged?(p) }
                     sc.onDragEnded   = { [weak coordinator] p in coordinator?.onDragEnded?(p, sid) }
                     sc.onDoubleTap   = { [weak coordinator] in coordinator?.onDoubleTap?(sid) }
+                    sc.onPhotoReplaced = { [weak coordinator, sid] img in coordinator?.onPhotoReplaced?(sid, img) }
                     let sv = StickerUIView(coordinator: sc)
                     stickerCoordinators[sticker.id] = sc
                     stickerViews[sticker.id] = sv
@@ -1362,6 +1936,8 @@ final class CanvasUIView: UIView {
                 let sv = stickerViews[sticker.id]!
                 let sc = stickerCoordinators[sticker.id]!
                 sc.sticker = coordinator.bindingForSticker(id: sticker.id)
+                let photoID = sticker.id
+                sc.onPhotoReplaced = { [weak coordinator, photoID] img in coordinator?.onPhotoReplaced?(photoID, img) }
                 sv.center = sticker.position
                 if !sc.isGesturing {
                     sv.transform = CGAffineTransform(rotationAngle: sticker.rotation.radians)
@@ -1381,7 +1957,12 @@ final class CanvasUIView: UIView {
                     )
                     let sid = sticker.id
                     sc.onGestureStart = gestureStart
-                    sc.onGestureEnd = gestureEnd
+                    sc.onGestureEnd = { [weak coordinator, sid] in
+                        guard coordinator?.isLassoActive != true else { return }
+                        coordinator?.canvasPan?.isEnabled = true
+                        coordinator?.canvasPinch?.isEnabled = true
+                        coordinator?.onStickerGestureEnded?(sid)
+                    }
                     sc.onDragChanged = { [weak coordinator] p in coordinator?.onDragChanged?(p) }
                     sc.onDragEnded   = { [weak coordinator] p in coordinator?.onDragEnded?(p, sid) }
                     // Double-tap opens the text editor; long press is left free so dragging isn't blocked
@@ -1416,7 +1997,12 @@ final class CanvasUIView: UIView {
                         self?.coordinator?.onTapSticker(sid)
                     }
                     mc.onGestureStart = gestureStart
-                    mc.onGestureEnd = gestureEnd
+                    mc.onGestureEnd = { [weak coordinator, sid] in
+                        guard coordinator?.isLassoActive != true else { return }
+                        coordinator?.canvasPan?.isEnabled = true
+                        coordinator?.canvasPinch?.isEnabled = true
+                        coordinator?.onStickerGestureEnded?(sid)
+                    }
                     mc.onPositionChanged = { [weak self] newPos in
                         guard let self,
                               let idx = self.coordinator?.stickers.wrappedValue.firstIndex(where: { $0.id == sid })
@@ -1472,7 +2058,12 @@ final class CanvasUIView: UIView {
                     }
                     vc.onDoubleTap   = { [weak coordinator] in coordinator?.onDoubleTap?(sid) }
                     vc.onGestureStart = gestureStart
-                    vc.onGestureEnd = gestureEnd
+                    vc.onGestureEnd = { [weak coordinator, sid] in
+                        guard coordinator?.isLassoActive != true else { return }
+                        coordinator?.canvasPan?.isEnabled = true
+                        coordinator?.canvasPinch?.isEnabled = true
+                        coordinator?.onStickerGestureEnded?(sid)
+                    }
                     vc.onPositionChanged = { [weak self] newPos in
                         guard let self,
                               let idx = self.coordinator?.stickers.wrappedValue.firstIndex(where: { $0.id == sid })
@@ -1524,6 +2115,26 @@ final class CanvasUIView: UIView {
                 canvasView.bringSubviewToFront(vv)
             }
         }
+    }
+}
+
+// MARK: - CanvasUIView + UIScrollViewDelegate (vertical zoom)
+
+extension CanvasUIView: UIScrollViewDelegate {
+    func viewForZooming(in scrollView: UIScrollView) -> UIView? {
+        // Zoom the entire canvas (stickers + background) as one unit
+        canvasView
+    }
+
+    func scrollViewDidZoom(_ scrollView: UIScrollView) {
+        // Keep the canvas centred when zoomed out below the viewport size.
+        // Without this it snaps to the top-left corner on zoom-out.
+        let horizontalInset = max((scrollView.bounds.width  - scrollView.contentSize.width)  / 2, 0)
+        let verticalInset   = max((scrollView.bounds.height - scrollView.contentSize.height) / 2, 0)
+        scrollView.contentInset = UIEdgeInsets(
+            top: verticalInset, left: horizontalInset,
+            bottom: verticalInset, right: horizontalInset
+        )
     }
 }
 
@@ -1580,8 +2191,10 @@ final class CanvasCoordinator: NSObject, UIGestureRecognizerDelegate {
     var onDragChanged: ((CGPoint) -> Void)?
     var onDragEnded: ((CGPoint, UUID) -> Void)?
     var onStickerGestureStart: (() -> Void)?
+    var onStickerGestureEnded: ((UUID) -> Void)?
     var onTextEdit: ((UUID) -> Void)?
     var onDoubleTap: ((UUID) -> Void)?
+    var onPhotoReplaced: ((UUID, UIImage) -> Void)?
     weak var canvasView: UIView?
     weak var canvasPan: UIPanGestureRecognizer?
     weak var canvasPinch: UIPinchGestureRecognizer?
@@ -1650,4 +2263,5 @@ final class CanvasCoordinator: NSObject, UIGestureRecognizerDelegate {
         }
     }
 }
+
 

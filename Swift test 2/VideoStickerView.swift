@@ -164,6 +164,20 @@ final class VideoStickerUIView: UIView {
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
         bounds.contains(point)
     }
+
+    /// Captures the current video frame as a UIImage for use in cover photo rendering.
+    /// AVPlayerLayer is GPU-rendered and skipped by layer.render(in:), so we need this
+    /// to manually composite video content into cover snapshots.
+    func currentFrameImage() -> UIImage? {
+        guard let asset = player?.currentItem?.asset,
+              let time = player?.currentTime() else { return nil }
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
+        gen.requestedTimeToleranceBefore = .zero
+        gen.requestedTimeToleranceAfter = CMTime(seconds: 0.25, preferredTimescale: 600)
+        guard let cg = try? gen.copyCGImage(at: time, actualTime: nil) else { return nil }
+        return UIImage(cgImage: cg)
+    }
 }
 
 // MARK: - VideoStickerCoordinator

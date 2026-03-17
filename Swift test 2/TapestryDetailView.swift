@@ -24,7 +24,10 @@ struct TapestryDetailView: View {
                 StickerCanvasView(
                     tapestryID: tapestry.id,
                     initialCanvasData: tapestry.canvasData,
-                    canvasMode: mode
+                    canvasMode: mode,
+                    isCollaborative: tapestry.type == .group,
+                    isOwner: tapestry.ownerID == nil || tapestry.ownerID == store.currentUserID,
+                    onDismiss: onDismiss
                 )
                 .navigationTitle(tapestry.title)
                 .navigationBarTitleDisplayMode(.inline)

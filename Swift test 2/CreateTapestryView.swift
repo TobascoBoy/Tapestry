@@ -151,10 +151,10 @@ struct CreateTapestryView: View {
         let tapestry = Tapestry(
             title: trimmed,
             description: description.trimmingCharacters(in: .whitespaces),
-            type: tapestryType
+            type: tapestryType,
+            canvasMode: canvasMode
         )
         store.add(tapestry)
-        store.setCanvasMode(tapestryID: tapestry.id, mode: canvasMode)
         onCreated?(tapestry)
         dismiss()
     }

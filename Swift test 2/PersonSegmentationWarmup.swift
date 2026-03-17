@@ -13,13 +13,24 @@ final class PersonSegmentationWarmup {
 
     private init() {
         guard let cgImage = makeTinyImage() else { return }
-        let request = VNGeneratePersonSegmentationRequest()
-        request.qualityLevel = .balanced
-        request.outputPixelFormat = kCVPixelFormatType_OneComponent8
-        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-        try? handler.perform([request])
+
+        // Warm up VNGeneratePersonSegmentationRequest (used by video bg removal)
+        let personRequest = VNGeneratePersonSegmentationRequest()
+        personRequest.qualityLevel = .balanced
+        personRequest.outputPixelFormat = kCVPixelFormatType_OneComponent8
+        let personHandler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        try? personHandler.perform([personRequest])
+
+        // Warm up VNGenerateForegroundInstanceMaskRequest (used by photo long-press bg removal)
+        // Without this, first use freezes the UI for 10–30 seconds.
+        if #available(iOS 17.0, *) {
+            let fgRequest = VNGenerateForegroundInstanceMaskRequest()
+            let fgHandler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+            try? fgHandler.perform([fgRequest])
+        }
+
         PersonSegmentationWarmup.isWarmedUp = true
-        print("[PersonSegmentation] model warmed up")
+        print("[PersonSegmentation] models warmed up")
     }
 
     private func makeTinyImage() -> CGImage? {

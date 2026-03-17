@@ -35,48 +35,73 @@ final class NatureSegmentationProcessor {
         print("[NatureSegmenter] model ready: \(model != nil)")
     }
 
+    // Maximum time (seconds) allowed for CoreML inference before we assume the
+    // ANE process has hung and bail out.  The ANE can get stuck after the device
+    // has been idle for a long time; without a timeout the app freezes until the
+    // user force-quits or reboots.
+    private static let inferenceTimeoutSeconds: Double = 8
+
     /// Runs SegFormer-B2 segmentation on `image`. If the pixel at `imagePoint`
     /// (in image pixel coordinates) belongs to a nature class, returns a cutout
     /// UIImage with only that semantic region visible (transparent elsewhere).
-    /// Returns nil if the touch point is not on a nature class.
+    /// Returns nil if the touch point is not on a nature class, or if the ANE
+    /// does not respond within `inferenceTimeoutSeconds`.
     func extractNature(from image: UIImage, at imagePoint: CGPoint) async -> UIImage? {
         let source = image.normalized()
         print("[NatureSegmenter] image size: \(source.size), scale: \(source.scale), imagePoint: \(imagePoint)")
 
-        return await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async { [self] in
-                guard let pixelBuffer = source.toModelPixelBuffer() else {
-                    print("[NatureSegmenter] ❌ pixelBuffer creation failed")
-                    continuation.resume(returning: nil)
-                    return
+        // Run inference on a background thread, but race it against a timeout so
+        // an ANE hang never freezes the app.
+        return await withTaskGroup(of: UIImage?.self) { group in
+            // Worker: perform the actual CoreML inference
+            group.addTask { [self] in
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.global(qos: .userInitiated).async { [self] in
+                        guard let pixelBuffer = source.toModelPixelBuffer() else {
+                            print("[NatureSegmenter] ❌ pixelBuffer creation failed")
+                            continuation.resume(returning: nil)
+                            return
+                        }
+                        guard let output = try? self.model?.prediction(image: pixelBuffer) else {
+                            print("[NatureSegmenter] ❌ model prediction failed")
+                            continuation.resume(returning: nil)
+                            return
+                        }
+
+                        let classMap = output.classMap
+                        print("[NatureSegmenter] classMap shape: \(classMap.shape), dataType: \(classMap.dataType.rawValue)")
+                        let floatPtr = classMap.dataPointer.assumingMemoryBound(to: Float16.self)
+
+                        let sx = 512.0 / source.size.width
+                        let sy = 512.0 / source.size.height
+                        let mx = max(0, min(511, Int(imagePoint.x * sx)))
+                        let my = max(0, min(511, Int(imagePoint.y * sy)))
+
+                        let classAtPoint = Int32(floatPtr[my * 512 + mx])
+                        print("[NatureSegmenter] modelPoint: (\(mx), \(my)), classAtPoint: \(classAtPoint), isNature: \(Self.natureClasses.contains(classAtPoint))")
+
+                        guard Self.natureClasses.contains(classAtPoint) else {
+                            continuation.resume(returning: nil)
+                            return
+                        }
+
+                        let mask = Self.buildMask(floatPtr: floatPtr, targetClass: classAtPoint)
+                        continuation.resume(returning: Self.applyMask(mask, to: source))
+                    }
                 }
-                guard let output = try? self.model?.prediction(image: pixelBuffer) else {
-                    print("[NatureSegmenter] ❌ model prediction failed")
-                    continuation.resume(returning: nil)
-                    return
-                }
-
-                let classMap = output.classMap  // MLMultiArray [512, 512], Float32
-                print("[NatureSegmenter] classMap shape: \(classMap.shape), dataType: \(classMap.dataType.rawValue)")
-                let floatPtr = classMap.dataPointer.assumingMemoryBound(to: Float16.self)
-
-                // Scale touch point → model coordinate space
-                let sx = 512.0 / source.size.width
-                let sy = 512.0 / source.size.height
-                let mx = max(0, min(511, Int(imagePoint.x * sx)))
-                let my = max(0, min(511, Int(imagePoint.y * sy)))
-
-                let classAtPoint = Int32(floatPtr[my * 512 + mx])
-                print("[NatureSegmenter] modelPoint: (\(mx), \(my)), classAtPoint: \(classAtPoint), isNature: \(Self.natureClasses.contains(classAtPoint))")
-
-                guard Self.natureClasses.contains(classAtPoint) else {
-                    continuation.resume(returning: nil)
-                    return
-                }
-
-                let mask = Self.buildMask(floatPtr: floatPtr, targetClass: classAtPoint)
-                continuation.resume(returning: Self.applyMask(mask, to: source))
             }
+
+            // Timeout sentinel: fires if ANE hangs
+            group.addTask {
+                try? await Task.sleep(for: .seconds(Self.inferenceTimeoutSeconds))
+                print("[NatureSegmenter] ⚠️ inference timed out — ANE may be hung")
+                return nil
+            }
+
+            // Return whichever finishes first; cancel the other.
+            let result = await group.next() ?? nil
+            group.cancelAll()
+            return result
         }
     }
 

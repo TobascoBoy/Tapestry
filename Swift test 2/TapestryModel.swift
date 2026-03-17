@@ -4,6 +4,12 @@ import SwiftUI
 import UIKit
 import Supabase
 
+// Broadcast payload sent when the owner deletes a group tapestry.
+// File-scope so it satisfies the Sendable requirement of channel.broadcast.
+struct TapestryDeletionMsg: Codable, Sendable {
+    let senderID: String
+}
+
 // MARK: - Tapestry Type
 
 enum TapestryType: String, Codable, Identifiable {
@@ -52,6 +58,8 @@ struct Tapestry: Identifiable, Codable, Hashable {
     var updatedAt: Date
     var type: TapestryType
     var canvasData: String?          // JSON canvas snapshot
+    var ownerID: UUID?               // nil only for legacy local-only tapestries
+    var canvasMode: CanvasMode       // stored in Supabase so all members share the same mode
 
     init(
         id: UUID = UUID(),
@@ -61,7 +69,9 @@ struct Tapestry: Identifiable, Codable, Hashable {
         createdAt: Date = Date(),
         updatedAt: Date = Date(),
         type: TapestryType = .personal,
-        canvasData: String? = nil
+        canvasData: String? = nil,
+        ownerID: UUID? = nil,
+        canvasMode: CanvasMode = .infinite
     ) {
         self.id = id
         self.title = title
@@ -71,10 +81,17 @@ struct Tapestry: Identifiable, Codable, Hashable {
         self.updatedAt = updatedAt
         self.type = type
         self.canvasData = canvasData
+        self.ownerID = ownerID
+        self.canvasMode = canvasMode
     }
 }
 
 // MARK: - Supabase row shapes
+
+private struct TapestryMemberRow: Decodable {
+    let tapestryID: UUID
+    enum CodingKeys: String, CodingKey { case tapestryID = "tapestry_id" }
+}
 
 /// What we send to Supabase on insert
 private struct TapestryInsert: Encodable {
@@ -83,6 +100,7 @@ private struct TapestryInsert: Encodable {
     let title: String
     let description: String
     let type: String
+    let canvasMode: String
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -90,6 +108,7 @@ private struct TapestryInsert: Encodable {
         case title
         case description
         case type
+        case canvasMode   = "canvas_mode"
     }
 }
 
@@ -98,21 +117,25 @@ private struct TapestryInsert: Encodable {
 /// (Supabase returns "2024-01-15T10:30:00.123456+00:00" which the default decoder rejects).
 private struct TapestryRow: Decodable {
     let id: UUID
+    let ownerID: UUID
     let title: String
     let description: String
     let type: String
     let createdAt: String
     let updatedAt: String
     let canvasData: String?
+    let canvasMode: String?   // nil for rows created before the column was added → defaults to .infinite
 
     enum CodingKeys: String, CodingKey {
         case id
+        case ownerID    = "owner_id"
         case title
         case description
         case type
         case createdAt  = "created_at"
         case updatedAt  = "updated_at"
         case canvasData = "canvas_data"
+        case canvasMode = "canvas_mode"
     }
 
     func toTapestry() -> Tapestry {
@@ -124,7 +147,9 @@ private struct TapestryRow: Decodable {
             createdAt: Self.parseDate(createdAt),
             updatedAt: Self.parseDate(updatedAt),
             type: TapestryType(rawValue: type) ?? .personal,
-            canvasData: canvasData
+            canvasData: canvasData,
+            ownerID: ownerID,
+            canvasMode: canvasMode.flatMap { CanvasMode(rawValue: $0) } ?? .infinite
         )
     }
 
@@ -224,7 +249,8 @@ final class TapestryStore {
     func fetch() async {
         guard let uid = currentUserID else { return }
         do {
-            let rows: [TapestryRow] = try await supabase
+            // 1. Tapestries the user owns
+            let owned: [TapestryRow] = try await supabase
                 .from("tapestries")
                 .select()
                 .eq("owner_id", value: uid.uuidString)
@@ -232,14 +258,40 @@ final class TapestryStore {
                 .execute()
                 .value
 
+            // 2. Tapestries the user joined via invite
+            let memberLinks: [TapestryMemberRow] = try await supabase
+                .from("tapestry_members")
+                .select("tapestry_id")
+                .eq("user_id", value: uid.uuidString)
+                .execute()
+                .value
+
+            var joined: [TapestryRow] = []
+            if !memberLinks.isEmpty {
+                let ids = memberLinks.map { $0.tapestryID.uuidString }
+                joined = try await supabase
+                    .from("tapestries")
+                    .select()
+                    .in("id", values: ids)
+                    .order("updated_at", ascending: false)
+                    .execute()
+                    .value
+            }
+
+            // Merge — owned first, then joined (skip duplicates)
+            var seen = Set<UUID>()
+            var all: [TapestryRow] = []
+            for row in owned + joined {
+                if seen.insert(row.id).inserted { all.append(row) }
+            }
+
             await MainActor.run {
                 let thumbMap = savedThumbnailMap
-                tapestries = rows.map { row in
+                tapestries = all.map { row in
                     var t = row.toTapestry()
                     t.thumbnailFilename = thumbMap[row.id.uuidString]
                     return t
                 }
-                // Reconcile order: add new IDs, drop deleted IDs
                 let activeIDs = Set(tapestries.map(\.id))
                 tapestryOrder = tapestryOrder.filter { activeIDs.contains($0) }
                 saveDisplayOrder()
@@ -265,7 +317,8 @@ final class TapestryStore {
                         ownerID: uid,
                         title: tapestry.title,
                         description: tapestry.description,
-                        type: tapestry.type.rawValue
+                        type: tapestry.type.rawValue,
+                        canvasMode: tapestry.canvasMode.rawValue
                     ))
                     .execute()
             } catch {
@@ -309,15 +362,23 @@ final class TapestryStore {
         tapestryOrder.removeAll { $0 == tapestry.id }
         saveDisplayOrder()
         thumbnailCache.removeValue(forKey: tapestry.id)
-        // Remove local thumbnail
         if let fn = tapestry.thumbnailFilename {
             try? FileManager.default.removeItem(at: thumbsDir.appendingPathComponent(fn))
         }
         var map = savedThumbnailMap
         map.removeValue(forKey: tapestry.id.uuidString)
         savedThumbnailMap = map
+        guard let uid = currentUserID else { return }
         Task {
             do {
+                // Notify members currently inside the canvas before deleting
+                let ch = await supabase.realtimeV2.channel("tapestry:\(tapestry.id.uuidString)")
+                await ch.subscribe()
+                try? await ch.broadcast(event: "tapestry-deleted",
+                                        message: TapestryDeletionMsg(senderID: uid.uuidString))
+                try? await Task.sleep(for: .milliseconds(600))
+                await ch.unsubscribe()
+
                 try await supabase
                     .from("tapestries")
                     .delete()
@@ -325,6 +386,34 @@ final class TapestryStore {
                     .execute()
             } catch {
                 print("TapestryStore.delete error: \(error)")
+            }
+        }
+    }
+
+    /// Removes the current user from a group tapestry they were invited to.
+    /// Does NOT delete the tapestry itself — other members are unaffected.
+    func leaveTapestry(_ tapestry: Tapestry) {
+        tapestries.removeAll { $0.id == tapestry.id }
+        tapestryOrder.removeAll { $0 == tapestry.id }
+        saveDisplayOrder()
+        thumbnailCache.removeValue(forKey: tapestry.id)
+        if let fn = tapestry.thumbnailFilename {
+            try? FileManager.default.removeItem(at: thumbsDir.appendingPathComponent(fn))
+        }
+        var map = savedThumbnailMap
+        map.removeValue(forKey: tapestry.id.uuidString)
+        savedThumbnailMap = map
+        guard let uid = currentUserID else { return }
+        Task {
+            do {
+                try await supabase
+                    .from("tapestry_members")
+                    .delete()
+                    .eq("tapestry_id", value: tapestry.id.uuidString)
+                    .eq("user_id", value: uid.uuidString)
+                    .execute()
+            } catch {
+                print("TapestryStore.leaveTapestry error: \(error)")
             }
         }
     }
@@ -361,31 +450,29 @@ final class TapestryStore {
         savedThumbnailMap = map
     }
 
-    // MARK: - Canvas Mode (per-tapestry, set at creation time)
-
-    private static let canvasModesKey = "tapestry_canvas_modes"
-    @ObservationIgnored private var canvasModeCache: [UUID: CanvasMode] = [:]
+    // MARK: - Canvas Mode
 
     func canvasMode(for tapestryID: UUID) -> CanvasMode {
-        if let cached = canvasModeCache[tapestryID] { return cached }
-        guard let data = UserDefaults.standard.data(forKey: Self.canvasModesKey),
-              let map  = try? JSONDecoder().decode([String: String].self, from: data),
-              let raw  = map[tapestryID.uuidString],
-              let mode = CanvasMode(rawValue: raw) else { return .infinite }
-        canvasModeCache[tapestryID] = mode
-        return mode
+        // Prefer the value stored on the Tapestry itself (sourced from Supabase),
+        // so all members of a shared tapestry see the same canvas mode.
+        tapestries.first(where: { $0.id == tapestryID })?.canvasMode ?? .infinite
     }
 
     func setCanvasMode(tapestryID: UUID, mode: CanvasMode) {
-        canvasModeCache[tapestryID] = mode
-        var map: [String: String] = [:]
-        if let data = UserDefaults.standard.data(forKey: Self.canvasModesKey),
-           let existing = try? JSONDecoder().decode([String: String].self, from: data) {
-            map = existing
+        // Update in-memory model immediately
+        if let i = tapestries.firstIndex(where: { $0.id == tapestryID }) {
+            tapestries[i].canvasMode = mode
         }
-        map[tapestryID.uuidString] = mode.rawValue
-        if let data = try? JSONEncoder().encode(map) {
-            UserDefaults.standard.set(data, forKey: Self.canvasModesKey)
+        // Persist to Supabase so joining members get the correct mode
+        Task {
+            struct ModeUpdate: Encodable {
+                let canvas_mode: String
+            }
+            try? await supabase
+                .from("tapestries")
+                .update(ModeUpdate(canvas_mode: mode.rawValue))
+                .eq("id", value: tapestryID.uuidString)
+                .execute()
         }
     }
 

@@ -19,6 +19,7 @@ struct CanvasState: Codable {
         var type: String                  // "color" | "image"
         var colorComponents: [Double]?    // r, g, b, a  (0-1)
         var imageFilename:   String?
+        var imageURL:        String?      // Supabase Storage URL
     }
 }
 
@@ -31,8 +32,10 @@ struct StickerState: Codable {
     var rotationRadians:  Double
     var zIndex:           Double
 
-    // photo
+    // photo (local)
     var imageFilename:    String?
+    // photo (Supabase)
+    var imageURL:         String?
 
     // text
     var textString:       String?
@@ -50,9 +53,12 @@ struct StickerState: Codable {
     var musicPreviewURLString:      String?
     var musicArtworkImageFilename:  String?   // cached artwork image on disk
 
-    // video
+    // video (local)
     var videoFilename:          String?
     var videoThumbnailFilename: String?
+    // video (Supabase)
+    var videoURL:               String?
+    var videoThumbnailURL:      String?
     var bgRemoved:              Bool?
 }
 

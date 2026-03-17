@@ -14,6 +14,7 @@ final class StickerCoordinator: NSObject, UIGestureRecognizerDelegate {
     var onDragEnded: ((CGPoint) -> Void)?     // screen-space position on release
     var onLongPress: (() -> Void)?            // override for long-press (e.g. text re-edit)
     var onDoubleTap: (() -> Void)?            // double-tap to enter lasso mode
+    var onPhotoReplaced: ((UIImage) -> Void)? // fired after background removal succeeds
     weak var panGesture: UIPanGestureRecognizer?
     var isGesturing = false
 
@@ -118,32 +119,108 @@ final class StickerCoordinator: NSObject, UIGestureRecognizerDelegate {
     }
 
     /// Tries nature segmentation at the touch point first; falls back to Vision foreground mask.
+    /// All heavy processing runs in a Task.detached so the main actor is never blocked.
     @MainActor
     private func smartRemoveBackground(touchPoint: CGPoint, on view: UIView?) async {
         guard case .photo(let currentImage) = sticker.wrappedValue.kind else { return }
 
-        // Show spinner so the user knows processing is happening
         let spinner = UIActivityIndicatorView(style: .medium)
         spinner.color = .white
         spinner.center = CGPoint(x: 0, y: 0)
         view?.addSubview(spinner)
         spinner.startAnimating()
-        defer {
-            spinner.stopAnimating()
-            spinner.removeFromSuperview()
-        }
 
         let source = currentImage.normalized()
-        let imagePoint = viewPointToImagePoint(touchPoint, image: source)
 
-        if let natureResult = await NatureSegmentationProcessor.shared.extractNature(
-            from: source, at: imagePoint
-        ) {
+        // 1. Try SegFormer-B2 nature segmentation at the touch point first.
+        let imagePoint = viewPointToImagePoint(touchPoint, image: source)
+        if let natureResult = await NatureSegmentationProcessor.shared.extractNature(from: source, at: imagePoint) {
+            spinner.stopAnimating()
+            spinner.removeFromSuperview()
             sticker.wrappedValue.kind = .photo(natureResult)
+            onPhotoReplaced?(natureResult)
             return
         }
 
-        await removeBackground()
+        // 2. Fall back to Vision foreground instance mask (person / salient subject).
+        // Race inference against a timeout so an ANE hang never freezes the app.
+        let result: UIImage? = await withTaskGroup(of: UIImage?.self) { group in
+            group.addTask {
+                await Task.detached(priority: .userInitiated) {
+                    print("[BgRemoval] source size: \(source.size)")
+                    guard #available(iOS 17.0, *) else {
+                        print("[BgRemoval] ❌ iOS 17 not available")
+                        return nil
+                    }
+                    // Downscale large images — Vision doesn't need full resolution and
+                    // 12MP images (3024×4032) cause multi-second hangs.
+                    let maxDim: CGFloat = 1024
+                    let visionInput: UIImage
+                    if source.size.width > maxDim || source.size.height > maxDim {
+                        let s = maxDim / max(source.size.width, source.size.height)
+                        let newSize = CGSize(width: source.size.width * s, height: source.size.height * s)
+                        let renderer = UIGraphicsImageRenderer(size: newSize)
+                        visionInput = renderer.image { _ in source.draw(in: CGRect(origin: .zero, size: newSize)) }
+                        print("[BgRemoval] downscaled to \(newSize) for Vision")
+                    } else {
+                        visionInput = source
+                    }
+                    guard let ciImage = CIImage(image: visionInput) else {
+                        print("[BgRemoval] ❌ CIImage creation failed")
+                        return nil
+                    }
+                    let request = VNGenerateForegroundInstanceMaskRequest()
+                    let handler = VNImageRequestHandler(ciImage: ciImage, options: [:])
+                    do {
+                        try handler.perform([request])
+                    } catch {
+                        print("[BgRemoval] ❌ handler.perform failed: \(error)")
+                        return nil
+                    }
+                    print("[BgRemoval] perform succeeded, results count: \(request.results?.count ?? 0)")
+                    guard let observation = request.results?.first else {
+                        print("[BgRemoval] ❌ no observations — Vision found no salient subjects")
+                        return nil
+                    }
+                    print("[BgRemoval] allInstances: \(observation.allInstances)")
+                    guard let maskedBuffer = try? observation.generateMaskedImage(
+                        ofInstances: observation.allInstances,
+                        from: handler,
+                        croppedToInstancesExtent: false
+                    ) else {
+                        print("[BgRemoval] ❌ generateMaskedImage failed")
+                        return nil
+                    }
+                    let outCI = CIImage(cvPixelBuffer: maskedBuffer)
+                    let ctx = CIContext()
+                    guard let cg = ctx.createCGImage(outCI, from: outCI.extent) else {
+                        print("[BgRemoval] ❌ createCGImage failed")
+                        return nil
+                    }
+                    print("[BgRemoval] ✅ cutout created successfully")
+                    return UIImage(cgImage: cg, scale: visionInput.scale, orientation: .up)
+                }.value
+            }
+
+            // Timeout sentinel: fires if ANE hangs
+            group.addTask {
+                try? await Task.sleep(for: .seconds(8))
+                print("[BgRemoval] ⚠️ inference timed out — ANE may be hung")
+                return nil
+            }
+
+            let result = await group.next() ?? nil
+            group.cancelAll()
+            return result
+        }
+
+        spinner.stopAnimating()
+        spinner.removeFromSuperview()
+
+        print("[BgRemoval] result: \(result == nil ? "nil ❌" : "valid image ✅")")
+        guard let result else { return }
+        sticker.wrappedValue.kind = .photo(result)
+        onPhotoReplaced?(result)
     }
 
     /// Converts a point in StickerUIView coordinate space (origin at center, ±110pt)
@@ -164,39 +241,6 @@ final class StickerCoordinator: NSObject, UIGestureRecognizerDelegate {
             x: (local.x - drawOrigin.x) / scale,
             y: (local.y - drawOrigin.y) / scale
         )
-    }
-
-    @MainActor
-    private func removeBackground() async {
-        guard #available(iOS 17.0, *) else { return }
-        guard case .photo(let currentImage) = sticker.wrappedValue.kind else { return }
-        let source = currentImage.normalized()
-        guard let ciImage = CIImage(image: source) else { return }
-
-        let cutout: UIImage? = await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let request = VNGenerateForegroundInstanceMaskRequest()
-                let handler = VNImageRequestHandler(ciImage: ciImage, options: [:])
-                guard (try? handler.perform([request])) != nil,
-                      let observation = request.results?.first,
-                      let maskedBuffer = try? observation.generateMaskedImage(
-                          ofInstances: observation.allInstances,
-                          from: handler,
-                          croppedToInstancesExtent: false
-                      )
-                else { continuation.resume(returning: nil); return }
-
-                let outCI = CIImage(cvPixelBuffer: maskedBuffer)
-                let ctx = CIContext()
-                guard let cg = ctx.createCGImage(outCI, from: outCI.extent) else {
-                    continuation.resume(returning: nil); return
-                }
-                continuation.resume(returning: UIImage(cgImage: cg, scale: source.scale, orientation: .up))
-            }
-        }
-
-        guard let cutout else { return }
-        sticker.wrappedValue.kind = .photo(cutout)
     }
 }
 
