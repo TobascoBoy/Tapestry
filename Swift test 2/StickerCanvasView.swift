@@ -682,8 +682,13 @@ struct StickerCanvasView: View {
                         } else {
                             url = try? await StickerAssetUploader.uploadImage(img, stickerID: sticker.id)
                         }
+                        // If the upload failed, skip this sticker entirely for this save cycle.
+                        // Writing imageURL = nil to the DB corrupts the record for other devices
+                        // that have no local fallback file. The local backup already has it safe;
+                        // the next save cycle will retry the upload.
+                        guard let url else { continue }
                         s.imageURL = url
-                        if let url = url { await MainActor.run { uploadedURLs[sticker.id] = url } }
+                        await MainActor.run { uploadedURLs[sticker.id] = url }
                     }
                 case .text(let c):
                     s.type = "text"; s.textString = c.text; s.fontIndex = c.fontIndex
@@ -715,10 +720,14 @@ struct StickerCanvasView: View {
                 // requires both URLs and would silently drop it. The next save cycle will retry.
                 if s.type == "video" && s.videoThumbnailURL == nil { continue }
                 stickerStates.append(s)
-                if let data = try? JSONEncoder().encode(CanvasState(background: bgState, stickers: stickerStates)),
-                   let json = String(data: data, encoding: .utf8) {
-                    await MainActor.run { store.updateCanvas(tapestryID: tid, canvasJSON: json) }
-                }
+            }
+            // Write once after all uploads complete. Writing inside the loop meant that
+            // two concurrent saveCanvas() tasks (e.g. debounce + app backgrounding) would
+            // interleave partial DB writes, with the older task's later writes able to
+            // overwrite the newer task's already-complete state.
+            if let data = try? JSONEncoder().encode(CanvasState(background: bgState, stickers: stickerStates)),
+               let json = String(data: data, encoding: .utf8) {
+                await MainActor.run { store.updateCanvas(tapestryID: tid, canvasJSON: json) }
             }
         }
     }
@@ -1614,6 +1623,7 @@ final class CanvasUIView: UIView {
     let canvasView = UIView()
     private let backgroundColorView = UIView()
     private let backgroundImageView = UIImageView()
+    private let centerGlowLayer = CAGradientLayer()   // radial warm glow, infinite canvas only
     let gridLayer = CanvasGridView()
 
     private var stickerViews: [UUID: StickerUIView] = [:]
@@ -1665,6 +1675,20 @@ final class CanvasUIView: UIView {
         backgroundColorView.backgroundColor = .white
         backgroundColorView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         canvasView.addSubview(backgroundColorView)
+
+        // Subtle radial warm glow at canvas center — infinite canvas only.
+        // Draws users toward the center without any explicit UI instruction.
+        if !isVertical {
+            centerGlowLayer.type        = .radial
+            centerGlowLayer.colors      = [
+                UIColor(red: 1.0, green: 0.91, blue: 0.76, alpha: 1.0).cgColor,  // warm cream
+                UIColor.white.cgColor                                              // pure white at edges
+            ]
+            centerGlowLayer.startPoint  = CGPoint(x: 0.5, y: 0.5)
+            centerGlowLayer.endPoint    = CGPoint(x: 1.0, y: 1.0)
+            centerGlowLayer.frame       = backgroundColorView.bounds
+            backgroundColorView.layer.addSublayer(centerGlowLayer)
+        }
 
         // Background image (hidden until set)
         backgroundImageView.frame = canvasView.bounds

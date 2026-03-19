@@ -13,6 +13,7 @@ struct AuthView: View {
     @State private var isLoading    = false
     @State private var errorMessage: String?
     @State private var showEmailForm = false
+    @State private var showVerificationPrompt = false
 
     var body: some View {
         ZStack {
@@ -26,13 +27,86 @@ struct AuthView: View {
                     Text("TAPESTRY")
                         .font(.custom("Avenir-Light", size: 38))
                         .tracking(6)
-                    Text(isSignUp ? "Create an account" : "Welcome back")
+                    Text(showVerificationPrompt ? "Check your email" : (isSignUp ? "Create an account" : "Welcome back"))
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
                 .padding(.bottom, 40)
 
-                if showEmailForm {
+                if showVerificationPrompt {
+                    // Verification prompt screen
+                    VStack(spacing: 20) {
+                        Image(systemName: "envelope.circle.fill")
+                            .font(.system(size: 64))
+                            .foregroundStyle(.primary)
+
+                        VStack(spacing: 8) {
+                            Text("We sent a link to")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                            Text(email)
+                                .font(.subheadline)
+                                .fontWeight(.semibold)
+                            Text("Tap it to verify your account, then come back here to sign in.")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal, 8)
+                        }
+
+                        VStack(spacing: 12) {
+                            Button {
+                                withAnimation {
+                                    showVerificationPrompt = false
+                                    showEmailForm = false
+                                    isSignUp = false
+                                    errorMessage = nil
+                                    password = ""
+                                }
+                            } label: {
+                                ZStack {
+                                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                        .fill(Color.black)
+                                        .frame(height: 52)
+                                    Text("Back to Sign In")
+                                        .font(.system(size: 16, weight: .semibold))
+                                        .foregroundStyle(.white)
+                                }
+                            }
+                            .padding(.horizontal, 24)
+
+                            Button {
+                                Task { await submit() }
+                            } label: {
+                                ZStack {
+                                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                        .strokeBorder(Color.primary.opacity(0.3), lineWidth: 1.5)
+                                        .frame(height: 52)
+                                    if isLoading {
+                                        ProgressView()
+                                    } else {
+                                        Text("Resend Email")
+                                            .font(.system(size: 16, weight: .semibold))
+                                            .foregroundStyle(.primary)
+                                    }
+                                }
+                            }
+                            .disabled(isLoading)
+                            .padding(.horizontal, 24)
+
+                            if let error = errorMessage {
+                                Text(error)
+                                    .font(.caption)
+                                    .foregroundStyle(.red)
+                                    .padding(.horizontal, 28)
+                            }
+                        }
+                        .padding(.top, 8)
+                    }
+                    .padding(.horizontal, 24)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+
+                } else if showEmailForm {
                     // Email form
                     VStack(spacing: 12) {
                         if isSignUp {
@@ -100,22 +174,46 @@ struct AuthView: View {
                     .padding(.top, 12)
 
                 } else {
-                    // Choice buttons
+                    // Landing: two equal-weight buttons + Apple
                     VStack(spacing: 12) {
-                        // Continue with Email
+                        // Create Account — primary filled
                         Button {
-                            withAnimation { showEmailForm = true }
+                            withAnimation { isSignUp = true; showEmailForm = true }
                         } label: {
                             ZStack {
                                 RoundedRectangle(cornerRadius: 14, style: .continuous)
                                     .fill(Color.black)
                                     .frame(height: 52)
-                                Text(isSignUp ? "Sign up with Email" : "Sign in with Email")
+                                Text("Create Account")
                                     .font(.system(size: 16, weight: .semibold))
                                     .foregroundStyle(.white)
                             }
                         }
                         .padding(.horizontal, 24)
+
+                        // Log In — secondary outline
+                        Button {
+                            withAnimation { isSignUp = false; showEmailForm = true }
+                        } label: {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                    .strokeBorder(Color.primary.opacity(0.3), lineWidth: 1.5)
+                                    .frame(height: 52)
+                                Text("Log In")
+                                    .font(.system(size: 16, weight: .semibold))
+                                    .foregroundStyle(.primary)
+                            }
+                        }
+                        .padding(.horizontal, 24)
+
+                        // Divider
+                        HStack {
+                            Rectangle().fill(Color.primary.opacity(0.15)).frame(height: 1)
+                            Text("or").font(.caption).foregroundStyle(.secondary).padding(.horizontal, 8)
+                            Rectangle().fill(Color.primary.opacity(0.15)).frame(height: 1)
+                        }
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 4)
 
                         // Sign in with Apple
                         SignInWithAppleButton(
@@ -156,20 +254,6 @@ struct AuthView: View {
                     .transition(.opacity)
                 }
 
-                // Toggle sign in / sign up
-                Button {
-                    withAnimation {
-                        isSignUp.toggle()
-                        showEmailForm = false
-                        errorMessage = nil
-                    }
-                } label: {
-                    Text(isSignUp ? "Already have an account? Sign in" : "Don't have an account? Sign up")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.top, 20)
-
                 Spacer()
             }
         }
@@ -184,6 +268,7 @@ struct AuthView: View {
                 if !fullName.trimmingCharacters(in: .whitespaces).isEmpty {
                     profileName = fullName.trimmingCharacters(in: .whitespaces)
                 }
+                withAnimation { showVerificationPrompt = true }
             } else {
                 try await auth.signIn(email: email, password: password)
             }

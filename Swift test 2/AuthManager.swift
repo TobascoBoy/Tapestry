@@ -77,6 +77,14 @@ final class AuthManager {
         )
     }
 
+    // MARK: - Deep link handling
+
+    @MainActor
+    func handle(url: URL) async {
+        try? await supabase.auth.session(from: url)
+        // authStateChanges listener in init() automatically picks up the new session
+    }
+
     enum AuthError: LocalizedError {
         case missingCredentials
         var errorDescription: String? { "Sign in with Apple failed. Please try again." }

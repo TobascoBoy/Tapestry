@@ -27,8 +27,19 @@ struct Swift_test_2App: App {
     @State private var auth             = AuthManager()
     @State private var tapestryStore    = TapestryStore()
     @State private var splashMinimumDone = false   // enforces minimum logo display time
+    @State private var showOnboarding   = false
+    @State private var showOnboardingCreate = false  // cascade to CreateTapestryView after onboarding
 
     @AppStorage("app_appearance") private var appAppearance: Int = 0  // 0=system, 1=light, 2=dark
+
+    // Per-user onboarding flag so returning users on the same device are never shown it again
+    private func onboardingKey(for uid: UUID) -> String { "onboarding_complete_\(uid)" }
+    private func hasCompletedOnboarding(for uid: UUID) -> Bool {
+        UserDefaults.standard.bool(forKey: onboardingKey(for: uid))
+    }
+    private func markOnboardingComplete(for uid: UUID) {
+        UserDefaults.standard.set(true, forKey: onboardingKey(for: uid))
+    }
 
     private var preferredColorScheme: ColorScheme? {
         switch appAppearance {
@@ -77,16 +88,50 @@ struct Swift_test_2App: App {
                     splashMinimumDone = true
                 }
             }
+            .onOpenURL { url in
+                Task { await auth.handle(url: url) }
+            }
+            .fullScreenCover(isPresented: $showOnboarding) {
+                OnboardingView(
+                    onSkip: {
+                        if let uid = auth.userID { markOnboardingComplete(for: uid) }
+                        showOnboarding = false
+                    },
+                    onCreateTapestry: {
+                        if let uid = auth.userID { markOnboardingComplete(for: uid) }
+                        showOnboarding = false
+                        // Small delay so the cover dismisses before the next sheet appears
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                            showOnboardingCreate = true
+                        }
+                    }
+                )
+                .environment(auth)
+            }
+            .sheet(isPresented: $showOnboardingCreate) {
+                CreateTapestryView()
+                    .environment(tapestryStore)
+            }
             .onChange(of: auth.isSignedIn) { _, signedIn in
                 if signedIn {
                     tapestryStore.currentUserID = auth.userID
                     Task { await tapestryStore.fetch() }
                     if let uid = auth.userID {
                         Task { await ProfileService.fetchAndCache(userID: uid) }
+                        if !hasCompletedOnboarding(for: uid) {
+                            showOnboarding = true
+                        }
                     }
                 } else {
                     tapestryStore.currentUserID = nil
                     tapestryStore.clear()
+                    // Clear cached profile so the next account's sign-in starts blank
+                    for key in ["profile_name", "profile_bio", "profile_pronouns",
+                                "profile_avatar_url", "profile_has_photo"] {
+                        UserDefaults.standard.removeObject(forKey: key)
+                    }
+                    // Remove local avatar file
+                    try? FileManager.default.removeItem(at: ProfileService.localAvatarURL())
                 }
             }
         }

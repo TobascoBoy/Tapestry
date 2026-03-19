@@ -249,6 +249,8 @@ final class StickerCoordinator: NSObject, UIGestureRecognizerDelegate {
 final class StickerUIView: UIView {
     let imageView = UIImageView()
     private let border = UIView()
+    private let outlineView = UIImageView()   // raster outline image — Apple CI pipeline
+    private var lastOutlineSourceImage: UIImage?
     private weak var coordinator: StickerCoordinator?
     var usesBoundingBoxHitTest = false
 
@@ -276,6 +278,15 @@ final class StickerUIView: UIView {
         border.layer.cornerRadius = 14
         border.isUserInteractionEnabled = false
         addSubview(border)
+
+        // Outline view: same frame as imageView, same contentMode.
+        // The CI-generated outline image is the same pixel size as the source image,
+        // so scaleAspectFit positions it identically to the photo being outlined.
+        outlineView.contentMode            = .scaleAspectFit
+        outlineView.frame                  = CGRect(x: -110, y: -110, width: 220, height: 220)
+        outlineView.isUserInteractionEnabled = false
+        outlineView.isHidden               = true
+        insertSubview(outlineView, belowSubview: border)
 
         layer.shadowRadius = 6
         layer.shadowOpacity = 0.3
@@ -320,9 +331,52 @@ final class StickerUIView: UIView {
                 imageView.image = image
             }
         }
-        border.isHidden = !isSelected
+        let bgRemoved = hasBgRemoved(image)
+        if isSelected && bgRemoved {
+            border.isHidden = true
+            // Generate outline image once per unique source image (identity cache).
+            if lastOutlineSourceImage !== image, let cg = image.cgImage {
+                outlineView.image = SubjectOutlineGenerator.generateOutlineImage(
+                    cgImage: cg, color: .systemBlue)
+                lastOutlineSourceImage = image
+            }
+            outlineView.isHidden = (outlineView.image == nil)
+            if outlineView.isHidden { border.isHidden = false }  // fallback
+        } else if isSelected {
+            border.isHidden      = false
+            outlineView.isHidden = true
+        } else {
+            border.isHidden      = true
+            outlineView.isHidden = true
+        }
         layer.shadowRadius = isSelected ? 10 : 6
         coordinator?.panGesture?.isEnabled = isSelected
+    }
+
+    /// Returns true if any corner pixel of the image has alpha < 128,
+    /// indicating the image has had its background removed.
+    private func hasBgRemoved(_ image: UIImage) -> Bool {
+        guard let cg = image.cgImage else { return false }
+        let ai = cg.alphaInfo
+        guard ai != .none, ai != .noneSkipFirst, ai != .noneSkipLast else { return false }
+        let w = cg.width, h = cg.height
+        guard w > 0, h > 0 else { return false }
+
+        // Reuse one 1×1 context for all four corner samples.
+        guard let ctx = CGContext(data: nil, width: 1, height: 1,
+                                  bitsPerComponent: 8, bytesPerRow: 4,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return false }
+
+        for (cx, cy) in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)] {
+            ctx.clear(CGRect(x: 0, y: 0, width: 1, height: 1))
+            ctx.draw(cg, in: CGRect(x: -cx, y: -(h - cy - 1), width: w, height: h))
+            guard let data = ctx.data else { continue }
+            let alpha = data.load(fromByteOffset: 3, as: UInt8.self)
+            if alpha < 128 { return true }
+        }
+        return false
     }
 
     // Hit-test only on non-transparent pixels (skipped for text stickers)

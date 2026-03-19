@@ -4,7 +4,6 @@ import AVFoundation
 // MARK: - VideoStickerUIView
 
 final class VideoStickerUIView: UIView {
-
     static let size: CGFloat = 220
 
     // For raw video: regular AVPlayerLayer inside a clipping container
