@@ -55,6 +55,8 @@ enum CanvasSerializer {
                 ? "\(sticker.id.uuidString).gif"
                 : "\(sticker.id.uuidString).png"
             s.imageURL = uploadedURLs[sticker.id]
+        case .photoLoading:
+            return nil  // transient remote placeholder — never persist
         case .text(let c):
             applyText(c, to: &s)
         case .music(let t):

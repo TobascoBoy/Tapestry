@@ -1,6 +1,7 @@
 import SwiftUI
 import PhotosUI
 import UIKit
+import Combine
 
 // MARK: - StickerCanvasView
 
@@ -236,6 +237,7 @@ struct StickerCanvasView: View {
             }
         }
         .overlay { if coverPickerMode { coverPickerOverlay(vm: vm) } }
+        .overlay { tapestryLoadingOverlay(vm: vm) }
     }
 
     // MARK: - Toolbar Buttons
@@ -425,6 +427,29 @@ struct StickerCanvasView: View {
         UIColor(red: 0.85, green: 0.95, blue: 0.88, alpha: 1),
     ]
 
+    // MARK: - Tapestry Loading Overlay
+
+    @ViewBuilder
+    private func tapestryLoadingOverlay(vm: CanvasViewModel) -> some View {
+        if vm.isLoadingAssets {
+            ZStack {
+                // Frosted glass — blurs the canvas behind so elements are visible but soft
+                Color.clear
+                    .background(.ultraThinMaterial)
+                    .ignoresSafeArea()
+
+                VStack(spacing: 14) {
+                    GoldSpinner()
+                    LoadingDotsText()
+                }
+                .padding(.horizontal, 28)
+                .padding(.vertical, 22)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            }
+            .transition(.opacity)
+        }
+    }
+
     // MARK: - Trash Zone
 
     private var trashZone: some View {
@@ -568,6 +593,59 @@ private struct CornerTicks: Shape {
     }
 }
 
+
+// MARK: - GoldSpinner
+
+private struct GoldSpinner: View {
+    @State private var rotation: Double = 0
+
+    private let gold: [Color] = [
+        Color(red: 0.72, green: 0.53, blue: 0.04),
+        Color(red: 1.00, green: 0.84, blue: 0.20),
+        Color(red: 0.95, green: 0.72, blue: 0.10),
+        Color(red: 1.00, green: 0.92, blue: 0.50),
+        Color(red: 0.72, green: 0.53, blue: 0.04),
+    ]
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(Color.primary.opacity(0.08), lineWidth: 5)
+                .frame(width: 44, height: 44)
+
+            Circle()
+                .trim(from: 0.05, to: 0.80)
+                .stroke(
+                    AngularGradient(colors: gold, center: .center),
+                    style: StrokeStyle(lineWidth: 5, lineCap: .round)
+                )
+                .frame(width: 44, height: 44)
+                .rotationEffect(.degrees(rotation))
+                .onAppear {
+                    withAnimation(.linear(duration: 0.9).repeatForever(autoreverses: false)) {
+                        rotation = 360
+                    }
+                }
+        }
+    }
+}
+
+// MARK: - LoadingDotsText
+
+private struct LoadingDotsText: View {
+    @State private var dotCount: Int = 1
+
+    private let timer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        Text("Loading Tapestry" + String(repeating: ".", count: dotCount))
+            .font(.system(size: 15, weight: .semibold))
+            .foregroundStyle(.secondary)
+            .onReceive(timer) { _ in
+                dotCount = dotCount % 3 + 1
+            }
+    }
+}
 
 // MARK: - Shake Detection
 

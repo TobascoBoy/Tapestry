@@ -278,6 +278,13 @@ private struct ThumbnailView: View {
                     .font(.system(size: 7))
                     .foregroundStyle(.white)
             }
+
+        case .photoLoading:
+            ZStack {
+                Color(white: 0.22)
+                ProgressView()
+                    .tint(.white)
+            }
         }
     }
 }

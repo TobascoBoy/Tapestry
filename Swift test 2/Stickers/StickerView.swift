@@ -251,6 +251,8 @@ final class StickerUIView: UIView {
     private let border = UIView()
     private let outlineView = UIImageView()   // raster outline image — Apple CI pipeline
     private var lastOutlineSourceImage: UIImage?
+    private let loadingBackground = UIView()
+    private let loadingSpinner = UIActivityIndicatorView(style: .large)
     private weak var coordinator: StickerCoordinator?
     var usesBoundingBoxHitTest = false
 
@@ -288,6 +290,19 @@ final class StickerUIView: UIView {
         outlineView.isHidden               = true
         insertSubview(outlineView, belowSubview: border)
 
+        loadingBackground.frame = CGRect(x: -80, y: -80, width: 160, height: 160)
+        loadingBackground.backgroundColor = UIColor.secondarySystemFill
+        loadingBackground.layer.cornerRadius = 12
+        loadingBackground.isHidden = true
+        loadingBackground.isUserInteractionEnabled = false
+        addSubview(loadingBackground)
+
+        loadingSpinner.center = .zero
+        loadingSpinner.color = .label
+        loadingSpinner.isHidden = true
+        loadingSpinner.isUserInteractionEnabled = false
+        addSubview(loadingSpinner)
+
         layer.shadowRadius = 6
         layer.shadowOpacity = 0.3
         layer.shadowOffset = .zero
@@ -314,7 +329,28 @@ final class StickerUIView: UIView {
         }
     }
 
+    func configureLoading(isSelected: Bool) {
+        // Hide everything — a full-screen overlay in StickerCanvasView handles the loading UX.
+        // Individual per-sticker spinners/placeholders would show through the frosted overlay
+        // and clutter the background canvas that's meant to peek through.
+        imageView.stopAnimating()
+        imageView.animationImages = nil
+        imageView.image = nil
+        loadingBackground.isHidden = true
+        loadingSpinner.stopAnimating()
+        loadingSpinner.isHidden = true
+        border.isHidden      = true
+        outlineView.isHidden = true
+        alpha = 0
+        coordinator?.panGesture?.isEnabled = false
+    }
+
     func configure(image: UIImage, isSelected: Bool) {
+        alpha = 1  // restore if previously hidden by configureLoading
+        loadingBackground.isHidden = true
+        loadingSpinner.stopAnimating()
+        loadingSpinner.isHidden = true
+
         if let frames = image.images, !frames.isEmpty {
             // Animated GIF — drive UIImageView's built-in frame animation
             if imageView.animationImages?.first !== frames.first {

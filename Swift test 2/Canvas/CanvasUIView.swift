@@ -351,13 +351,15 @@ final class CanvasUIView: UIView {
                   a.scale == b.scale && a.rotation == b.rotation && a.zIndex == b.zIndex
             else { return false }
             switch (a.kind, b.kind) {
-            case (.photo(let ia), .photo(let ib)):    return ia === ib
+            case (.photo(let ia), .photo(let ib)):       return ia === ib
             case (.text(let ta),  .text(let tb)):
                 return ta.text == tb.text && ta.fontIndex == tb.fontIndex &&
                        ta.colorIndex == tb.colorIndex && ta.wrapWidth == tb.wrapWidth &&
                        ta.alignment == tb.alignment && ta.bgStyle == tb.bgStyle
-            case (.music(let ma), .music(let mb)):    return ma.artworkImage === mb.artworkImage
-            default:                                  return true
+            case (.music(let ma), .music(let mb)):       return ma.artworkImage === mb.artworkImage
+            case (.photoLoading, .photoLoading):         return true
+            case (.photoLoading, _), (_, .photoLoading): return false  // loading state changed
+            default:                                     return true
             }
         }) } ?? false
         let selectionSame = lastSyncedSelection == selectedID
@@ -434,6 +436,38 @@ final class CanvasUIView: UIView {
                         .scaledBy(x: sticker.scale, y: sticker.scale)
                 }
                 sv.configure(image: img, isSelected: selectedID == sticker.id)
+                canvasView.bringSubviewToFront(sv)
+
+            case .photoLoading:
+                if stickerViews[sticker.id] == nil {
+                    let binding = coordinator.bindingForSticker(id: sticker.id)
+                    let sc = StickerCoordinator(sticker: binding, onTapSelect: { [weak self] in
+                        self?.coordinator?.onTapSticker(sticker.id)
+                    })
+                    let sid = sticker.id
+                    sc.onGestureStart = gestureStart
+                    sc.onGestureEnd = { [weak coordinator, sid] in
+                        guard coordinator?.isLassoActive != true else { return }
+                        coordinator?.canvasPan?.isEnabled   = true
+                        coordinator?.canvasPinch?.isEnabled = true
+                        coordinator?.onStickerGestureEnded?(sid)
+                    }
+                    sc.onDragChanged = { [weak coordinator] p in coordinator?.onDragChanged?(p) }
+                    sc.onDragEnded   = { [weak coordinator] p in coordinator?.onDragEnded?(p, sid) }
+                    let sv = StickerUIView(coordinator: sc)
+                    stickerCoordinators[sticker.id] = sc
+                    stickerViews[sticker.id] = sv
+                    canvasView.addSubview(sv)
+                }
+                let sv = stickerViews[sticker.id]!
+                let sc = stickerCoordinators[sticker.id]!
+                sc.sticker = coordinator.bindingForSticker(id: sticker.id)
+                sv.center = sticker.position
+                if !sc.isGesturing {
+                    sv.transform = CGAffineTransform(rotationAngle: sticker.rotation.radians)
+                        .scaledBy(x: sticker.scale, y: sticker.scale)
+                }
+                sv.configureLoading(isSelected: selectedID == sticker.id)
                 canvasView.bringSubviewToFront(sv)
 
             case .text(let content):

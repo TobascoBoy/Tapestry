@@ -14,14 +14,43 @@ enum StickerAssetUploader {
 
     // MARK: - Upload
 
-    /// Upload a static or background-removed photo. Always PNG to preserve alpha.
+    /// Upload a static or background-removed photo.
+    /// Uses JPEG (0.85) for opaque images (camera photos) — ~5–8× smaller than PNG with no
+    /// visible quality loss. Preserves PNG for images with an alpha channel (bg-removed cutouts).
     static func uploadImage(_ image: UIImage, stickerID: UUID) async throws -> String {
-        guard let data = image.pngData() else { throw AssetError.encodingFailed }
-        let path = "\(stickerID.uuidString).png"
-        try await supabase.storage
-            .from(bucket)
-            .upload(path, data: data, options: .init(contentType: "image/png", upsert: true))
-        return try supabase.storage.from(bucket).getPublicURL(path: path).absoluteString
+        if hasAlpha(image) {
+            guard let data = image.pngData() else { throw AssetError.encodingFailed }
+            let path = "\(stickerID.uuidString).png"
+            try await supabase.storage
+                .from(bucket)
+                .upload(path, data: data, options: .init(contentType: "image/png", upsert: true))
+            return try supabase.storage.from(bucket).getPublicURL(path: path).absoluteString
+        } else {
+            guard let data = image.jpegData(compressionQuality: 0.85) else { throw AssetError.encodingFailed }
+            let path = "\(stickerID.uuidString).jpg"
+            try await supabase.storage
+                .from(bucket)
+                .upload(path, data: data, options: .init(contentType: "image/jpeg", upsert: true))
+            return try supabase.storage.from(bucket).getPublicURL(path: path).absoluteString
+        }
+    }
+
+    /// Returns true if the image has an alpha channel (e.g. background-removed cutout).
+    private static func hasAlpha(_ image: UIImage) -> Bool {
+        guard let cgImage = image.cgImage else { return false }
+        switch cgImage.alphaInfo {
+        case .none, .noneSkipFirst, .noneSkipLast: return false
+        default: return true
+        }
+    }
+
+    /// Derives the local cache file extension from a remote URL string.
+    /// ".gif" → "gif", ".jpg"/".jpeg" → "jpg", anything else → "png".
+    /// Used by download code so JPEG uploads (new) and PNG uploads (legacy) both resolve correctly.
+    static func ext(for urlString: String) -> String {
+        if urlString.hasSuffix(".gif")  { return "gif" }
+        if urlString.hasSuffix(".jpg") || urlString.hasSuffix(".jpeg") { return "jpg" }
+        return "png"
     }
 
     /// Upload a GIF by reading its already-saved local file (preserves animation frames).

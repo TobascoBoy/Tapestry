@@ -55,6 +55,7 @@ final class CanvasViewModel {
     // MARK: - System state
 
     var canvasLoaded:             Bool                    = false
+    var isLoadingAssets:          Bool                    = false
     var showTapestryDeletedAlert: Bool                    = false
     var collabSession:            TapestryCollabSession?  = nil
     var canvasUIView:             CanvasUIView?           = nil
@@ -62,8 +63,10 @@ final class CanvasViewModel {
 
     // MARK: - Private
 
-    private var undoStack:    [CanvasSnapshot]       = []
-    private var autosaveTask: Task<Void, Never>?     = nil
+    private var undoStack:           [CanvasSnapshot]       = []
+    private var autosaveTask:        Task<Void, Never>?     = nil
+    private var pendingUploadTasks:  [UUID: Task<Void, Never>] = [:]
+    private var pendingRemoteOps:    [UUID: [StickerOp]]       = [:]
 
     // MARK: - Init
 
@@ -185,12 +188,16 @@ final class CanvasViewModel {
             return
         }
 
+        // Background: apply color synchronously; fetch background image in a background Task
+        // so it doesn't block the canvas from appearing.
         switch state.background.type {
         case "image":
-            if let urlString = state.background.imageURL,
-               let localURL = try? await StickerAssetUploader.cachedLocalURL(for: urlString, ext: "png"),
-               let img = UIImage(contentsOfFile: localURL.path) {
-                canvasBackground = .image(img)
+            if let urlString = state.background.imageURL {
+                Task {
+                    guard let localURL = try? await StickerAssetUploader.cachedLocalURL(for: urlString, ext: "png"),
+                          let img = UIImage(contentsOfFile: localURL.path) else { return }
+                    canvasBackground = .image(img)
+                }
             }
         default:
             if let c = state.background.colorComponents, c.count == 4 {
@@ -198,26 +205,172 @@ final class CanvasViewModel {
             }
         }
 
-        var loaded: [Sticker] = []
-        await withTaskGroup(of: Sticker?.self) { group in
-            for s in state.stickers {
-                group.addTask {
-                    guard let result = await self.deserializeSticker(from: s) else { return nil }
-                    if let url = result.uploadedURL  { await MainActor.run { self.uploadedURLs[s.id] = url } }
-                    if let url = result.thumbnailURL { await MainActor.run { self.uploadedThumbnailURLs[s.id] = url } }
-                    return result.sticker
+        // Pass 1 (synchronous, ~0 ms): deserialize text/music inline; for photos check the disk
+        // cache and either load immediately or show a .photoLoading placeholder; enqueue videos
+        // and uncached photos for async download in Pass 2.
+        var initialStickers: [Sticker] = []
+        var downloadQueue:   [StickerState] = []
+
+        for s in state.stickers {
+            let pos = CGPoint(x: s.x, y: s.y)
+            let rot = Angle(radians: s.rotationRadians)
+
+            switch s.type {
+            case StickerTypeKey.text:
+                guard let content = TextStickerContent.deserialize(
+                    textString: s.textString, fontIndex: s.fontIndex, colorIndex: s.colorIndex,
+                    wrapWidth: s.textWrapWidth, alignment: s.textAlignment, bgStyle: s.textBGStyle
+                ) else { continue }
+                initialStickers.append(Sticker(id: s.id, kind: .text(content), position: pos,
+                                               scale: s.scale, rotation: rot, zIndex: s.zIndex))
+
+            case StickerTypeKey.music:
+                guard let mid = s.musicID, let title = s.musicTitle, let artist = s.musicArtist else { continue }
+                let track = MusicTrack(id: mid, title: title, artistName: artist,
+                    artworkURL: s.musicArtworkURLString.flatMap { URL(string: $0) },
+                    previewURL: s.musicPreviewURLString.flatMap { URL(string: $0) })
+                initialStickers.append(Sticker(id: s.id, kind: .music(track), position: pos,
+                                               scale: s.scale, rotation: rot, zIndex: s.zIndex))
+
+            case StickerTypeKey.photo:
+                var added = false
+                if let urlString = s.imageURL {
+                    let ext      = StickerAssetUploader.ext(for: urlString)
+                    let cacheURL = StickerAssetUploader.cacheFileURL(for: urlString, ext: ext)
+                    if FileManager.default.fileExists(atPath: cacheURL.path) {
+                        let img = ext == "gif"
+                            ? UIImage.animatedGIF(from: cacheURL)
+                            : UIImage(contentsOfFile: cacheURL.path)
+                        if let img {
+                            initialStickers.append(Sticker(id: s.id, kind: .photo(img), position: pos,
+                                                           scale: s.scale, rotation: rot, zIndex: s.zIndex))
+                            uploadedURLs[s.id] = urlString
+                            added = true
+                        }
+                    }
+                } else if let fn = s.imageFilename, let img = StickerStorage.loadImage(filename: fn) {
+                    initialStickers.append(Sticker(id: s.id, kind: .photo(img), position: pos,
+                                                   scale: s.scale, rotation: rot, zIndex: s.zIndex))
+                    added = true
                 }
+                if !added {
+                    // Not in cache — show placeholder immediately, stream in via Pass 2
+                    initialStickers.append(Sticker(id: s.id, kind: .photoLoading, position: pos,
+                                                   scale: s.scale, rotation: rot, zIndex: s.zIndex))
+                    downloadQueue.append(s)
+                }
+
+            case StickerTypeKey.video:
+                // No placeholder for video — a .photoLoading → .video type swap in CanvasUIView
+                // causes layout artifacts. Let the sticker appear when download finishes.
+                downloadQueue.append(s)
+
+            default:
+                break
             }
-            for await sticker in group { if let sticker { loaded.append(sticker) } }
         }
 
-        loaded.sort { $0.zIndex < $1.zIndex }
-        stickers     = loaded
-        topZ         = loaded.map { $0.zIndex }.max() ?? 0
+        // Canvas appears immediately with text/music and cached photos visible.
+        initialStickers.sort { $0.zIndex < $1.zIndex }
+        stickers     = initialStickers
+        topZ         = initialStickers.map { $0.zIndex }.max() ?? 0
         canvasLoaded = true
 
+        // Pass 2 — two independent phases so videos never block the overlay.
+        //
+        // Phase A: uncached photos  → parallel download behind the loading overlay.
+        //          Overlay dismisses as soon as all photos are in.
+        //
+        // Phase B: videos           → thumbnail downloads first so the sticker
+        //          appears immediately, then the full .mp4 downloads silently in
+        //          the background and upgrades the sticker to playable.
+        if !downloadQueue.isEmpty {
+            let photoDownloads = downloadQueue.filter { $0.type == StickerTypeKey.photo }
+            let videoDownloads = downloadQueue.filter { $0.type == StickerTypeKey.video }
+
+            // Overlay only blocks on photos (fast). Videos never hold it up.
+            isLoadingAssets = !photoDownloads.isEmpty
+            let pass2Start = Date()
+            print("[Load] Pass 2 — \(photoDownloads.count) photo(s), \(videoDownloads.count) video(s)")
+
+            Task {
+                // ── Phase A: Photos ───────────────────────────────────────────
+                if !photoDownloads.isEmpty {
+                    await withTaskGroup(of: Sticker?.self) { group in
+                        for s in photoDownloads {
+                            group.addTask {
+                                let t0 = Date()
+                                guard let result = await self.deserializeSticker(from: s) else {
+                                    print("[Load] ❌ photo:\(s.id.uuidString.prefix(6)) — \(String(format: "%.2f", -t0.timeIntervalSinceNow))s")
+                                    return nil
+                                }
+                                print("[Load] ✅ photo:\(s.id.uuidString.prefix(6)) — \(String(format: "%.2f", -t0.timeIntervalSinceNow))s")
+                                if let url = result.uploadedURL  { await MainActor.run { self.uploadedURLs[s.id]          = url } }
+                                if let url = result.thumbnailURL { await MainActor.run { self.uploadedThumbnailURLs[s.id] = url } }
+                                return result.sticker
+                            }
+                        }
+                        for await sticker in group {
+                            guard let sticker else { continue }
+                            if let idx = stickers.firstIndex(where: { $0.id == sticker.id }) {
+                                stickers[idx] = sticker
+                            }
+                            canvasUIView?.invalidateStickerCache()
+                        }
+                    }
+                    print("[Load] Photos done — \(String(format: "%.2f", -pass2Start.timeIntervalSinceNow))s total")
+                    withAnimation(.easeOut(duration: 0.35)) { isLoadingAssets = false }
+                }
+
+                // ── Phase B: Videos ───────────────────────────────────────────
+                // Each video gets its own Task so they download in parallel and
+                // don't block each other or the now-visible canvas.
+                for s in videoDownloads {
+                    Task {
+                        let t0 = Date()
+                        let tag = "video:\(s.id.uuidString.prefix(6))"
+                        guard let vURL = s.videoURL, let tURL = s.videoThumbnailURL else { return }
+                        let pos = CGPoint(x: s.x, y: s.y)
+                        let rot = Angle(radians: s.rotationRadians)
+
+                        // Step 1 — thumbnail (small PNG, arrives in <1 s)
+                        guard let localThumbURL = try? await StickerAssetUploader.cachedLocalURL(for: tURL, ext: "png"),
+                              let thumb = UIImage(contentsOfFile: localThumbURL.path) else {
+                            print("[Load] ❌ \(tag) thumb — \(String(format: "%.2f", -t0.timeIntervalSinceNow))s")
+                            return
+                        }
+                        print("[Load] ✅ \(tag) thumb — \(String(format: "%.2f", -t0.timeIntervalSinceNow))s")
+
+                        // Show thumbnail as a photo sticker so the user sees something right away
+                        let thumbSticker = Sticker(id: s.id, kind: .photo(thumb), position: pos,
+                                                   scale: s.scale, rotation: rot, zIndex: s.zIndex)
+                        stickers.append(thumbSticker)
+                        stickers.sort { $0.zIndex < $1.zIndex }
+                        topZ = max(topZ, s.zIndex)
+                        uploadedThumbnailURLs[s.id] = tURL
+                        canvasUIView?.invalidateStickerCache()
+
+                        // Step 2 — full video (large, may take many seconds)
+                        guard let localVideoURL = try? await StickerAssetUploader.cachedLocalURL(for: vURL, ext: "mp4") else {
+                            print("[Load] ❌ \(tag) mp4 — \(String(format: "%.2f", -t0.timeIntervalSinceNow))s")
+                            return
+                        }
+                        print("[Load] ✅ \(tag) mp4 — \(String(format: "%.2f", -t0.timeIntervalSinceNow))s")
+
+                        // Upgrade thumbnail → playable video sticker
+                        if let idx = stickers.firstIndex(where: { $0.id == s.id }) {
+                            stickers[idx].kind = .video(videoURL: localVideoURL, thumbnail: thumb,
+                                                        bgRemoved: s.bgRemoved ?? false)
+                            uploadedURLs[s.id] = vURL
+                            canvasUIView?.invalidateStickerCache()
+                        }
+                    }
+                }
+            }
+        }
+
         // Artwork images are not persisted — re-fetch from artworkURL for every music sticker.
-        for sticker in loaded {
+        for sticker in initialStickers {
             guard case .music(let track) = sticker.kind, let artURL = track.artworkURL else { continue }
             let sid = sticker.id
             Task {
@@ -292,6 +445,8 @@ final class CanvasViewModel {
                 zIndex: sticker.zIndex
             )
             switch sticker.kind {
+            case .photoLoading:
+                continue  // transient remote placeholder — never serialize
             case .photo(let img):
                 s.type = StickerTypeKey.photo
                 s.imageFilename = img.images != nil
@@ -352,7 +507,14 @@ final class CanvasViewModel {
             stickers[i].rotation = Angle(radians: radians)
         case .add:
             guard let state = op.sticker, !stickers.contains(where: { $0.id == op.stickerID }) else { return }
-            Task { await applyRemoteAdd(state) }
+            let sid = op.stickerID
+            Task {
+                await applyRemoteAdd(state)
+                // Flush any ops that arrived before opAdd (e.g. opUpdatePhoto racing ahead)
+                if let buffered = self.pendingRemoteOps.removeValue(forKey: sid) {
+                    for bufferedOp in buffered { self.applyRemoteOp(bufferedOp) }
+                }
+            }
         case .delete:
             withAnimation(.spring(duration: 0.2)) {
                 stickers.removeAll { $0.id == op.stickerID }
@@ -370,12 +532,19 @@ final class CanvasViewModel {
             stickers[i].kind = .text(content)
             canvasUIView?.invalidateStickerCache()
         case .updatePhoto:
-            guard let urlString = op.imageURL, let i = stickers.firstIndex(where: { $0.id == op.stickerID }) else { return }
+            guard let urlString = op.imageURL else { return }
+            guard stickers.contains(where: { $0.id == op.stickerID }) else {
+                // opAdd hasn't arrived yet — buffer for when it does
+                pendingRemoteOps[op.stickerID, default: []].append(op)
+                return
+            }
+            let sid = op.stickerID
             Task {
-                let ext = urlString.hasSuffix(".gif") ? "gif" : "png"
+                let ext = StickerAssetUploader.ext(for: urlString)
                 guard let localURL = try? await StickerAssetUploader.cachedLocalURL(for: urlString, ext: ext),
-                      let img = UIImage(contentsOfFile: localURL.path) else { return }
-                uploadedURLs[op.stickerID] = urlString
+                      let img = UIImage(contentsOfFile: localURL.path),
+                      let i = self.stickers.firstIndex(where: { $0.id == sid }) else { return }
+                uploadedURLs[sid] = urlString
                 stickers[i].kind = .photo(img)
                 canvasUIView?.invalidateStickerCache()
             }
@@ -423,7 +592,7 @@ final class CanvasViewModel {
             let img: UIImage?
             var cachedURL: String? = nil
             if let urlString = state.imageURL {
-                let ext = urlString.hasSuffix(".gif") ? "gif" : "png"
+                let ext = StickerAssetUploader.ext(for: urlString)
                 if let localURL = try? await StickerAssetUploader.cachedLocalURL(for: urlString, ext: ext) {
                     img = ext == "gif" ? UIImage.animatedGIF(from: localURL) : UIImage(contentsOfFile: localURL.path)
                     if img != nil { cachedURL = urlString }
@@ -435,7 +604,10 @@ final class CanvasViewModel {
             } else if let fn = state.imageFilename {
                 img = StickerStorage.loadImage(filename: fn)
             } else {
-                img = nil
+                // No URL and no filename — remote placeholder broadcast before upload completed
+                let sticker = Sticker(id: state.id, kind: .photoLoading, position: pos,
+                                      scale: state.scale, rotation: rot, zIndex: state.zIndex)
+                return StickerDeserialization(sticker: sticker, uploadedURL: nil, thumbnailURL: nil)
             }
             guard let img else { return nil }
             let sticker = Sticker(id: state.id, kind: .photo(img), position: pos,
@@ -485,6 +657,9 @@ final class CanvasViewModel {
     }
 
     func broadcastPhotoReplaced(stickerID: UUID, image: UIImage) {
+        // Cancel any in-flight original upload so its opUpdatePhoto doesn't overwrite bg-removal
+        pendingUploadTasks[stickerID]?.cancel()
+        pendingUploadTasks.removeValue(forKey: stickerID)
         let fn = "\(stickerID.uuidString).png"
         Task.detached(priority: .utility) { StickerStorage.saveImage(image, filename: fn) }
         uploadedURLs.removeValue(forKey: stickerID)
@@ -501,6 +676,8 @@ final class CanvasViewModel {
     // MARK: - Sticker Management
 
     func deleteSticker(id: UUID) {
+        pendingUploadTasks[id]?.cancel()
+        pendingUploadTasks.removeValue(forKey: id)
         saveUndoState()
         withAnimation(.spring(duration: 0.2)) {
             stickers.removeAll { $0.id == id }
@@ -566,21 +743,29 @@ final class CanvasViewModel {
         selectedStickerID = sticker.id
 
         if let session = collabSession, tapestryID != nil {
-            let pos = sticker.position; let z = sticker.zIndex; let img = uiImage
-            Task(priority: .utility) { [weak self] in
+            // Broadcast opAdd immediately with no URL — remote clients get a loading placeholder
+            let placeholderState = StickerState(id: stickerID, type: StickerTypeKey.photo,
+                x: sticker.position.x, y: sticker.position.y, scale: 1.0, rotationRadians: 0,
+                zIndex: sticker.zIndex)
+            session.broadcast(session.opAdd(sticker: placeholderState))
+
+            // Upload in background; broadcast opUpdatePhoto when done
+            let img = uiImage
+            let task = Task(priority: .utility) { [weak self] in
                 let url: String?
                 if img.images != nil {
                     url = try? await StickerAssetUploader.uploadGIF(stickerID: stickerID)
                 } else {
                     url = try? await StickerAssetUploader.uploadImage(img, stickerID: stickerID)
                 }
-                guard let url else { return }
-                await MainActor.run { self?.uploadedURLs[stickerID] = url }
-                var state = StickerState(id: stickerID, type: StickerTypeKey.photo,
-                    x: pos.x, y: pos.y, scale: 1.0, rotationRadians: 0, zIndex: z)
-                state.imageURL = url
-                session.broadcast(session.opAdd(sticker: state))
+                guard let url, !Task.isCancelled else { return }
+                await MainActor.run {
+                    self?.uploadedURLs[stickerID] = url
+                    self?.pendingUploadTasks.removeValue(forKey: stickerID)
+                    session.broadcast(session.opUpdatePhoto(stickerID: stickerID, imageURL: url))
+                }
             }
+            pendingUploadTasks[stickerID] = task
         }
     }
 
@@ -595,15 +780,24 @@ final class CanvasViewModel {
         selectedStickerID = sticker.id
 
         if let session = collabSession {
-            let pos = sticker.position; let z = sticker.zIndex; let img = normalized
-            Task(priority: .utility) { [weak self] in
-                guard let url = try? await StickerAssetUploader.uploadImage(img, stickerID: stickerID) else { return }
-                await MainActor.run { self?.uploadedURLs[stickerID] = url }
-                var state = StickerState(id: stickerID, type: StickerTypeKey.photo,
-                    x: pos.x, y: pos.y, scale: 1.0, rotationRadians: 0, zIndex: z)
-                state.imageURL = url
-                session.broadcast(session.opAdd(sticker: state))
+            // Broadcast opAdd immediately with no URL — remote clients get a loading placeholder
+            let placeholderState = StickerState(id: stickerID, type: StickerTypeKey.photo,
+                x: sticker.position.x, y: sticker.position.y, scale: 1.0, rotationRadians: 0,
+                zIndex: sticker.zIndex)
+            session.broadcast(session.opAdd(sticker: placeholderState))
+
+            // Upload in background; broadcast opUpdatePhoto when done
+            let img = normalized
+            let task = Task(priority: .utility) { [weak self] in
+                guard let url = try? await StickerAssetUploader.uploadImage(img, stickerID: stickerID),
+                      !Task.isCancelled else { return }
+                await MainActor.run {
+                    self?.uploadedURLs[stickerID] = url
+                    self?.pendingUploadTasks.removeValue(forKey: stickerID)
+                    session.broadcast(session.opUpdatePhoto(stickerID: stickerID, imageURL: url))
+                }
             }
+            pendingUploadTasks[stickerID] = task
         }
     }
 
@@ -717,6 +911,8 @@ final class CanvasViewModel {
                 state.imageURL      = uploadedURLs[s.id]
                 state.imageFilename = "\(s.id.uuidString).png"
                 guard state.imageURL != nil else { continue }
+            case .photoLoading:
+                continue  // loading placeholder has no URL — skip
             case .text(let c):
                 CanvasSerializer.applyText(c, to: &state)
             case .music(let t):

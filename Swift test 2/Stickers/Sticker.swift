@@ -12,6 +12,7 @@ enum CanvasBackground {
 
 enum StickerKind {
     case photo(UIImage)
+    case photoLoading   // Remote placeholder while upload is in flight
     case text(TextStickerContent)
     case music(MusicTrack)
     case video(videoURL: URL, thumbnail: UIImage, bgRemoved: Bool = false)
@@ -57,6 +58,8 @@ struct Sticker: Identifiable, Equatable {
         switch (lhs.kind, rhs.kind) {
         case (.photo(let a), .photo(let b)):
             return a === b
+        case (.photoLoading, .photoLoading):
+            return true
         case (.video(let ua, let ta, let ba), .video(let ub, let tb, let bb)):
             return ua == ub && ta === tb && ba == bb
         case (.text(let a), .text(let b)):
