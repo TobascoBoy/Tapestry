@@ -282,6 +282,7 @@ final class VideoStickerUIView: UIView {
 
 final class VideoStickerCoordinator: NSObject, UIGestureRecognizerDelegate {
     let stickerID:         UUID
+    var isReadOnly:        Bool = false
     var onTapSelect:       (() -> Void)?
     var onDoubleTap:       (() -> Void)?
     var onGestureStart:    (() -> Void)?
@@ -314,7 +315,7 @@ final class VideoStickerCoordinator: NSObject, UIGestureRecognizerDelegate {
     @objc func handleDoubleTap(_ gr: UITapGestureRecognizer) { onDoubleTap?() }
 
     @objc func handlePan(_ gr: UIPanGestureRecognizer) {
-        guard let v = gr.view else { return }
+        guard !isReadOnly, let v = gr.view else { return }
         switch gr.state {
         case .began:
             onGestureStart?()
@@ -334,6 +335,7 @@ final class VideoStickerCoordinator: NSObject, UIGestureRecognizerDelegate {
     }
 
     @objc func handlePinch(_ gr: UIPinchGestureRecognizer) {
+        guard !isReadOnly else { return }
         switch gr.state {
         case .began:
             onGestureStart?()
@@ -348,6 +350,7 @@ final class VideoStickerCoordinator: NSObject, UIGestureRecognizerDelegate {
     }
 
     @objc func handleRotate(_ gr: UIRotationGestureRecognizer) {
+        guard !isReadOnly else { return }
         switch gr.state {
         case .began:
             onGestureStart?()

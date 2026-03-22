@@ -4,6 +4,7 @@ import SwiftUI
 
 struct TapestryDetailView: View {
     let tapestry: Tapestry
+    var isReadOnly: Bool = false
     var onDismiss: (() -> Void)? = nil
 
     @Environment(TapestryStore.self) private var store
@@ -29,6 +30,7 @@ struct TapestryDetailView: View {
                     canvasMode: mode,
                     isCollaborative: tapestry.type == .group,
                     isOwner: tapestry.ownerID == nil || tapestry.ownerID == store.currentUserID,
+                    isReadOnly: isReadOnly,
                     onDismiss: onDismiss
                 )
                 .navigationTitle(tapestry.title)

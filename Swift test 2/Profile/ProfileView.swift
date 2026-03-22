@@ -30,14 +30,7 @@ struct ProfileView: View {
     @AppStorage("profile_pronouns")    private var profilePronouns:    String = ""
     @AppStorage("profile_has_photo")   private var hasPhoto:           Bool   = false
     @AppStorage("profile_avatar_url")  private var profileAvatarURL:   String = ""
-    @AppStorage("pinned_tapestry_id")  private var pinnedTapestryIDStr: String = ""
-
-    private var pinnedTapestry: Tapestry? {
-        guard !pinnedTapestryIDStr.isEmpty,
-              let id = UUID(uuidString: pinnedTapestryIDStr)
-        else { return nil }
-        return store.tapestries.first { $0.id == id }
-    }
+    private var pinnedTapestry: Tapestry? { store.pinnedTapestry }
 
     private var unpinnedTapestries: [Tapestry] {
         store.orderedUnpinnedTapestries(excludingPinnedID: pinnedTapestry?.id)
@@ -84,7 +77,7 @@ struct ProfileView: View {
                         if !unpinnedTapestries.isEmpty {
                             TapestryGridView(
                                 tapestries: unpinnedTapestries,
-                                pinnedTapestryIDStr: $pinnedTapestryIDStr,
+                                onPin: { store.setPinned(tapestryID: $0) },
                                 coverPickTapestry: $coverPickTapestry,
                                 coverPickAspectRatio: $coverPickAspectRatio,
                                 onSelect: enterTapestry
@@ -216,7 +209,7 @@ struct ProfileView: View {
                                 .animation(.spring(response: 0.3), value: showTypePopup)
                         }
                     }
-                    .padding(.bottom, 32)
+                    .padding(.bottom, 96)
                 }
             }
             .ignoresSafeArea(edges: .bottom)
@@ -430,7 +423,7 @@ struct ProfileView: View {
                     Label("Edit Cover", systemImage: "crop")
                 }
                 Button {
-                    withAnimation { pinnedTapestryIDStr = "" }
+                    withAnimation { store.setPinned(tapestryID: nil) }
                 } label: {
                     Label("Unpin", systemImage: "pin.slash")
                 }

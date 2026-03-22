@@ -53,6 +53,9 @@ struct Tapestry: Identifiable, Codable, Hashable {
     var canvasData: String?          // JSON canvas snapshot
     var ownerID: UUID?               // nil only for legacy local-only tapestries
     var canvasMode: CanvasMode       // stored in Supabase so all members share the same mode
+    var coverShape: CoverShape       // grid cell shape — synced to Supabase so visitors see owner's layout
+    var displayOrder: Int            // ordering in profile grid — synced to Supabase
+    var isPinned: Bool               // pinned to top of profile — synced to Supabase
 
     init(
         id: UUID = UUID(),
@@ -65,7 +68,10 @@ struct Tapestry: Identifiable, Codable, Hashable {
         type: TapestryType = .personal,
         canvasData: String? = nil,
         ownerID: UUID? = nil,
-        canvasMode: CanvasMode = .infinite
+        canvasMode: CanvasMode = .infinite,
+        coverShape: CoverShape = .square,
+        displayOrder: Int = 0,
+        isPinned: Bool = false
     ) {
         self.id = id
         self.title = title
@@ -78,5 +84,8 @@ struct Tapestry: Identifiable, Codable, Hashable {
         self.canvasData = canvasData
         self.ownerID = ownerID
         self.canvasMode = canvasMode
+        self.coverShape = coverShape
+        self.displayOrder = displayOrder
+        self.isPinned = isPinned
     }
 }

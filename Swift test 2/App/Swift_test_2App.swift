@@ -33,6 +33,103 @@ private class AppDelegate: NSObject, UIApplicationDelegate {
     }
 }
 
+// MARK: - AppTab
+
+enum AppTab { case profile, discover }
+
+// MARK: - RootContentView
+
+private struct RootContentView: View {
+    let auth: AuthManager
+    let store: TapestryStore
+
+    @State private var selectedTab: AppTab = .profile
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            // ── Tab content ─────────────────────────────────────────────────
+            ProfileView()
+                .environment(store)
+                .environment(auth)
+                .opacity(selectedTab == .profile ? 1 : 0)
+                .allowsHitTesting(selectedTab == .profile)
+
+            NavigationStack {
+                SearchView()
+                    .toolbar(.hidden, for: .navigationBar)
+            }
+            .environment(auth)
+            .environment(store)
+            .opacity(selectedTab == .discover ? 1 : 0)
+            .allowsHitTesting(selectedTab == .discover)
+
+            // ── Custom tab bar ───────────────────────────────────────────────
+            AppTabBar(selectedTab: $selectedTab)
+        }
+        .ignoresSafeArea(edges: .bottom)
+    }
+}
+
+// MARK: - AppTabBar
+
+private struct AppTabBar: View {
+    @Binding var selectedTab: AppTab
+
+    // Spotify uses a near-black solid bar regardless of system theme.
+    private let barBackground = Color(red: 0.08, green: 0.08, blue: 0.08)
+    private let activeColor   = Color.white
+    private let inactiveColor = Color(white: 0.50)
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Subtle gradient shadow bleeding upward — Spotify-style depth
+            LinearGradient(
+                colors: [barBackground.opacity(0), barBackground],
+                startPoint: .top, endPoint: .bottom
+            )
+            .frame(height: 20)
+            .allowsHitTesting(false)
+
+            HStack(spacing: 0) {
+                tabButton(tab: .profile,
+                          icon: "person",
+                          filledIcon: "person.fill",
+                          label: "Profile")
+                tabButton(tab: .discover,
+                          icon: "magnifyingglass",
+                          filledIcon: "sparkle.magnifyingglass",
+                          label: "Discover")
+            }
+            .padding(.top, 8)
+            .safeAreaPadding(.bottom)
+            .background(barBackground)
+        }
+    }
+
+    private func tabButton(tab: AppTab, icon: String, filledIcon: String, label: String) -> some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            withAnimation(.easeInOut(duration: 0.15)) { selectedTab = tab }
+        } label: {
+            VStack(spacing: 5) {
+                Image(systemName: selectedTab == tab ? filledIcon : icon)
+                    .font(.system(size: 24, weight: selectedTab == tab ? .semibold : .regular))
+                    .foregroundStyle(selectedTab == tab ? activeColor : inactiveColor)
+                    .scaleEffect(selectedTab == tab ? 1.05 : 1.0)
+                    .animation(.spring(response: 0.2, dampingFraction: 0.7), value: selectedTab)
+
+                Text(label)
+                    .font(.system(size: 10, weight: selectedTab == tab ? .semibold : .regular))
+                    .foregroundStyle(selectedTab == tab ? activeColor : inactiveColor)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 // MARK: - Swift_test_2App
 
 @main
@@ -71,9 +168,7 @@ struct Swift_test_2App: App {
                 if showingSplash {
                     SplashView()
                 } else if auth.isSignedIn {
-                    ProfileView()
-                        .environment(tapestryStore)
-                        .environment(auth)
+                    RootContentView(auth: auth, store: tapestryStore)
                         .transition(.opacity)
                 } else {
                     AuthView()
@@ -132,6 +227,16 @@ struct Swift_test_2App: App {
                     Task { await tapestryStore.fetch() }
                     if let uid = auth.userID {
                         Task { await ProfileService.fetchAndCache(userID: uid) }
+                        // Backfill display_name / bio / pronouns to Supabase from local cache.
+                        // This ensures the users table is populated for search even if the
+                        // user has never explicitly saved their profile through settings.
+                        let cachedName     = UserDefaults.standard.string(forKey: "profile_name")     ?? ""
+                        let cachedBio      = UserDefaults.standard.string(forKey: "profile_bio")      ?? ""
+                        let cachedPronouns = UserDefaults.standard.string(forKey: "profile_pronouns") ?? ""
+                        if !cachedName.isEmpty {
+                            ProfileService.saveText(userID: uid, name: cachedName,
+                                                    bio: cachedBio, pronouns: cachedPronouns)
+                        }
                         if !hasCompletedOnboarding(for: uid) {
                             showOnboarding = true
                         }

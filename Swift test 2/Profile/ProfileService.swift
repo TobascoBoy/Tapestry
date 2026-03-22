@@ -77,7 +77,8 @@ enum ProfileService {
 
     static func saveText(userID: UUID, name: String, bio: String, pronouns: String) {
         Task(priority: .utility) {
-            struct TextUpdate: Encodable {
+            struct TextUpsert: Encodable {
+                let id:           String
                 let display_name: String
                 let bio:          String
                 let pronouns:     String
@@ -85,8 +86,10 @@ enum ProfileService {
             do {
                 try await supabase
                     .from("users")
-                    .update(TextUpdate(display_name: name, bio: bio, pronouns: pronouns))
-                    .eq("id", value: userID.uuidString)
+                    .upsert(TextUpsert(id: userID.uuidString,
+                                      display_name: name,
+                                      bio: bio,
+                                      pronouns: pronouns))
                     .execute()
             } catch {
                 print("[ProfileService] saveText error: \(error)")
@@ -112,11 +115,10 @@ enum ProfileService {
                 .getPublicURL(path: path)
                 .absoluteString
 
-            struct AvatarUpdate: Encodable { let avatar_url: String }
+            struct AvatarUpsert: Encodable { let id: String; let avatar_url: String }
             try await supabase
                 .from("users")
-                .update(AvatarUpdate(avatar_url: url))
-                .eq("id", value: userID.uuidString)
+                .upsert(AvatarUpsert(id: userID.uuidString, avatar_url: url))
                 .execute()
 
             await MainActor.run {

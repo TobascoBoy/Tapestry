@@ -36,6 +36,7 @@ final class CanvasViewModel {
     let coverPickerMode: Bool
     let isCollaborative: Bool
     let isOwner: Bool
+    let isReadOnly: Bool
     private let store: TapestryStore
 
     // MARK: - Canvas state (drives CanvasHostView bindings)
@@ -67,6 +68,11 @@ final class CanvasViewModel {
     private var autosaveTask:        Task<Void, Never>?     = nil
     private var pendingUploadTasks:  [UUID: Task<Void, Never>] = [:]
     private var pendingRemoteOps:    [UUID: [StickerOp]]       = [:]
+    // Tracks the highest photo generation seen per sticker on the receive path,
+    // so out-of-order / duplicate opUpdatePhoto broadcasts don't overwrite the cutout.
+    private var photoGenerations:    [UUID: Int]               = [:]
+    // Tracks the generation we've broadcast for each sticker on the send path.
+    private var broadcastPhotoGenerations: [UUID: Int]         = [:]
 
     // MARK: - Init
 
@@ -77,7 +83,8 @@ final class CanvasViewModel {
         canvasMode: CanvasMode,
         coverPickerMode: Bool,
         isCollaborative: Bool,
-        isOwner: Bool
+        isOwner: Bool,
+        isReadOnly: Bool = false
     ) {
         self.store             = store
         self.tapestryID        = tapestryID
@@ -86,6 +93,7 @@ final class CanvasViewModel {
         self.coverPickerMode   = coverPickerMode
         self.isCollaborative   = isCollaborative
         self.isOwner           = isOwner
+        self.isReadOnly        = isReadOnly
     }
 
     // MARK: - Lifecycle
@@ -198,6 +206,10 @@ final class CanvasViewModel {
                           let img = UIImage(contentsOfFile: localURL.path) else { return }
                     canvasBackground = .image(img)
                 }
+            }
+        case "live_scene":
+            if let name = state.background.sceneName, let scene = LiveBackgroundScene(rawValue: name) {
+                canvasBackground = .liveScene(scene)
             }
         default:
             if let c = state.background.colorComponents, c.count == 4 {
@@ -497,13 +509,22 @@ final class CanvasViewModel {
     func applyRemoteOp(_ op: StickerOp) {
         switch op.type {
         case .move:
-            guard let x = op.x, let y = op.y, let i = stickers.firstIndex(where: { $0.id == op.stickerID }) else { return }
+            guard let x = op.x, let y = op.y else { return }
+            guard let i = stickers.firstIndex(where: { $0.id == op.stickerID }) else {
+                pendingRemoteOps[op.stickerID, default: []].append(op); return
+            }
             stickers[i].position = CGPoint(x: x, y: y)
         case .scale:
-            guard let scale = op.scale, let i = stickers.firstIndex(where: { $0.id == op.stickerID }) else { return }
+            guard let scale = op.scale else { return }
+            guard let i = stickers.firstIndex(where: { $0.id == op.stickerID }) else {
+                pendingRemoteOps[op.stickerID, default: []].append(op); return
+            }
             stickers[i].scale = scale
         case .rotate:
-            guard let radians = op.rotationRadians, let i = stickers.firstIndex(where: { $0.id == op.stickerID }) else { return }
+            guard let radians = op.rotationRadians else { return }
+            guard let i = stickers.firstIndex(where: { $0.id == op.stickerID }) else {
+                pendingRemoteOps[op.stickerID, default: []].append(op); return
+            }
             stickers[i].rotation = Angle(radians: radians)
         case .add:
             guard let state = op.sticker, !stickers.contains(where: { $0.id == op.stickerID }) else { return }
@@ -539,11 +560,19 @@ final class CanvasViewModel {
                 return
             }
             let sid = op.stickerID
+            let incomingGen = op.photoGeneration ?? 0
+            // Discard if we've already applied a newer version of this sticker's photo
+            guard incomingGen >= (photoGenerations[sid] ?? -1) else { return }
+            // Claim this generation slot before the async download so a later-arriving
+            // lower-generation op (the non-cutout original) can't overwrite after we yield.
+            photoGenerations[sid] = incomingGen
             Task {
                 let ext = StickerAssetUploader.ext(for: urlString)
                 guard let localURL = try? await StickerAssetUploader.cachedLocalURL(for: urlString, ext: ext),
                       let img = UIImage(contentsOfFile: localURL.path),
                       let i = self.stickers.firstIndex(where: { $0.id == sid }) else { return }
+                // Re-check after the async download — a higher-gen op may have arrived
+                guard incomingGen >= (self.photoGenerations[sid] ?? -1) else { return }
                 uploadedURLs[sid] = urlString
                 stickers[i].kind = .photo(img)
                 canvasUIView?.invalidateStickerCache()
@@ -663,12 +692,15 @@ final class CanvasViewModel {
         let fn = "\(stickerID.uuidString).png"
         Task.detached(priority: .utility) { StickerStorage.saveImage(image, filename: fn) }
         uploadedURLs.removeValue(forKey: stickerID)
+        // Bump generation so any already-broadcast generation-1 op is ignored by receivers
+        let gen = (broadcastPhotoGenerations[stickerID] ?? 1) + 1
+        broadcastPhotoGenerations[stickerID] = gen
         Task(priority: .utility) { [weak self] in
             let uploadID = UUID()
             guard let url = try? await StickerAssetUploader.uploadImage(image, stickerID: uploadID) else { return }
             await MainActor.run {
                 self?.uploadedURLs[stickerID] = url
-                self?.collabSession.map { $0.broadcast($0.opUpdatePhoto(stickerID: stickerID, imageURL: url)) }
+                self?.collabSession.map { $0.broadcast($0.opUpdatePhoto(stickerID: stickerID, imageURL: url, generation: gen)) }
             }
         }
     }
@@ -676,6 +708,7 @@ final class CanvasViewModel {
     // MARK: - Sticker Management
 
     func deleteSticker(id: UUID) {
+        guard !isReadOnly else { return }
         pendingUploadTasks[id]?.cancel()
         pendingUploadTasks.removeValue(forKey: id)
         saveUndoState()
@@ -687,6 +720,7 @@ final class CanvasViewModel {
     }
 
     func addTextSticker(content: TextStickerContent) {
+        guard !isReadOnly else { return }
         saveUndoState()
         topZ += 1
         let sticker = Sticker(kind: .text(content), position: visibleCenter(),
@@ -702,14 +736,20 @@ final class CanvasViewModel {
     }
 
     func updateTextSticker(id: UUID, content: TextStickerContent) {
-        guard let idx = stickers.firstIndex(where: { $0.id == id }) else { return }
+        guard !isReadOnly, let idx = stickers.firstIndex(where: { $0.id == id }) else { return }
         saveUndoState()
         stickers[idx].kind = .text(content)
         canvasUIView?.invalidateStickerCache()
         collabSession.map { $0.broadcast($0.opUpdateText(stickerID: id, content: content)) }
     }
 
+    func setLiveBackground(_ scene: LiveBackgroundScene) {
+        guard !isReadOnly else { return }
+        canvasBackground = .liveScene(scene)
+    }
+
     func setBackgroundColor(_ color: UIColor) {
+        guard !isReadOnly else { return }
         canvasBackground = .color(color)
         if let session = collabSession {
             var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
@@ -719,6 +759,7 @@ final class CanvasViewModel {
     }
 
     func addStickerFromImage(from item: PhotosPickerItem) async {
+        guard !isReadOnly else { return }
         guard let data = try? await item.loadTransferable(type: Data.self) else { return }
 
         let stickerID = UUID()
@@ -749,6 +790,8 @@ final class CanvasViewModel {
                 zIndex: sticker.zIndex)
             session.broadcast(session.opAdd(sticker: placeholderState))
 
+            // Generation 1 = original photo. bg-removal will use generation 2+.
+            broadcastPhotoGenerations[stickerID] = 1
             // Upload in background; broadcast opUpdatePhoto when done
             let img = uiImage
             let task = Task(priority: .utility) { [weak self] in
@@ -762,7 +805,7 @@ final class CanvasViewModel {
                 await MainActor.run {
                     self?.uploadedURLs[stickerID] = url
                     self?.pendingUploadTasks.removeValue(forKey: stickerID)
-                    session.broadcast(session.opUpdatePhoto(stickerID: stickerID, imageURL: url))
+                    session.broadcast(session.opUpdatePhoto(stickerID: stickerID, imageURL: url, generation: 1))
                 }
             }
             pendingUploadTasks[stickerID] = task
@@ -770,6 +813,7 @@ final class CanvasViewModel {
     }
 
     func addStickerFromCapturedImage(_ image: UIImage) {
+        guard !isReadOnly else { return }
         let normalized = image.normalized()
         let stickerID = UUID()
         saveUndoState()
@@ -786,6 +830,8 @@ final class CanvasViewModel {
                 zIndex: sticker.zIndex)
             session.broadcast(session.opAdd(sticker: placeholderState))
 
+            // Generation 1 = original photo. bg-removal will use generation 2+.
+            broadcastPhotoGenerations[stickerID] = 1
             // Upload in background; broadcast opUpdatePhoto when done
             let img = normalized
             let task = Task(priority: .utility) { [weak self] in
@@ -794,7 +840,7 @@ final class CanvasViewModel {
                 await MainActor.run {
                     self?.uploadedURLs[stickerID] = url
                     self?.pendingUploadTasks.removeValue(forKey: stickerID)
-                    session.broadcast(session.opUpdatePhoto(stickerID: stickerID, imageURL: url))
+                    session.broadcast(session.opUpdatePhoto(stickerID: stickerID, imageURL: url, generation: 1))
                 }
             }
             pendingUploadTasks[stickerID] = task
@@ -802,6 +848,7 @@ final class CanvasViewModel {
     }
 
     func addVideoSticker(result: VideoProcessor.Result) {
+        guard !isReadOnly else { return }
         saveUndoState()
         topZ += 1
         let sticker = Sticker(
@@ -827,6 +874,7 @@ final class CanvasViewModel {
     }
 
     func addMusicSticker(track: MusicTrack) {
+        guard !isReadOnly else { return }
         saveUndoState()
         topZ += 1
         let sticker = Sticker(kind: .music(track), position: visibleCenter(),
@@ -879,6 +927,7 @@ final class CanvasViewModel {
     }
 
     func undo() {
+        guard !isReadOnly else { return }
         guard let snapshot = undoStack.popLast() else {
             UINotificationFeedbackGenerator().notificationOccurred(.error)
             return
@@ -945,7 +994,7 @@ final class CanvasViewModel {
     // MARK: - Canvas Helpers
 
     func bringToFront(stickerID: UUID) {
-        guard let idx = stickers.firstIndex(where: { $0.id == stickerID }) else { return }
+        guard !isReadOnly, let idx = stickers.firstIndex(where: { $0.id == stickerID }) else { return }
         topZ += 1
         stickers[idx].zIndex = topZ
         collabSession?.broadcast(collabSession!.opReorder(stickerID: stickerID, zIndex: topZ))

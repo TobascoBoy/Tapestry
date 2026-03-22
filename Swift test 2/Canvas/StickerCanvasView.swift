@@ -15,6 +15,7 @@ struct StickerCanvasView: View {
     var onCoverCancelled: (() -> Void)? = nil
     var isCollaborative: Bool = false
     var isOwner: Bool = true
+    var isReadOnly: Bool = false
     var onDismiss: (() -> Void)? = nil
 
     @Environment(TapestryStore.self) private var store
@@ -98,7 +99,8 @@ struct StickerCanvasView: View {
                 canvasMode: canvasMode,
                 coverPickerMode: coverPickerMode,
                 isCollaborative: isCollaborative,
-                isOwner: isOwner
+                isOwner: isOwner,
+                isReadOnly: isReadOnly
             )
             Task { await vm?.startCanvas() }
         }
@@ -110,23 +112,25 @@ struct StickerCanvasView: View {
     private func toolbarContent(vm: CanvasViewModel) -> some ToolbarContent {
         ToolbarItemGroup(placement: .bottomBar) {
             Spacer()
-            if !coverPickerMode && !showTrashZone { cameraButton }
+            if !isReadOnly && !coverPickerMode && !showTrashZone { cameraButton }
             Spacer()
         }
-        ToolbarItem(placement: .topBarLeading) {
-            Button {
-                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) { showLayersPanel.toggle() }
-            } label: {
-                Image(systemName: "square.3.layers.3d").font(.system(size: 17, weight: .semibold))
+        if !isReadOnly {
+            ToolbarItem(placement: .topBarLeading) {
+                Button {
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) { showLayersPanel.toggle() }
+                } label: {
+                    GlassToolbarIcon(systemName: "square.3.layers.3d")
+                }
             }
-        }
-        ToolbarItem(placement: .topBarTrailing) {
-            Button {
-                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) { showPlusMenu = true }
-            } label: {
-                Image(systemName: "sparkle").font(.system(size: 17, weight: .semibold))
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) { showPlusMenu = true }
+                } label: {
+                    GlassToolbarIcon(systemName: "sparkle")
+                }
             }
         }
         if isCollaborative && isOwner && !coverPickerMode {
@@ -226,7 +230,8 @@ struct StickerCanvasView: View {
                 withAnimation { showTextEditor = true }
             },
             onPhotoReplaced: { id, img in vm.broadcastPhotoReplaced(stickerID: id, image: img) },
-            onViewReady: { view in vm.canvasUIView = view }
+            onViewReady: { view in vm.canvasUIView = view },
+            isReadOnly: isReadOnly
         )
         .ignoresSafeArea()
         .background(ShakeDetector())
@@ -404,6 +409,34 @@ struct StickerCanvasView: View {
                     }
                 }
 
+                Divider()
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Live").font(.headline).padding(.horizontal)
+                    HStack(spacing: 12) {
+                        ForEach(LiveBackgroundScene.allCases, id: \.self) { scene in
+                            Button {
+                                vm.setLiveBackground(scene)
+                                showBackgroundSheet = false
+                            } label: {
+                                VStack(spacing: 6) {
+                                    Image(systemName: scene.systemIcon)
+                                        .font(.system(size: 26))
+                                    Text(scene.displayName)
+                                        .font(.caption)
+                                        .multilineTextAlignment(.center)
+                                }
+                                .foregroundStyle(.primary)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 14)
+                                .background(.thinMaterial)
+                                .clipShape(RoundedRectangle(cornerRadius: 14))
+                            }
+                        }
+                    }
+                    .padding(.horizontal)
+                }
+
                 Spacer()
             }
             .padding(.top, 20)
@@ -419,12 +452,26 @@ struct StickerCanvasView: View {
     }
 
     private let presetColors: [UIColor] = [
-        .white, .black, .systemGray6, .systemGray,
-        .systemRed, .systemOrange, .systemYellow, .systemGreen,
-        .systemTeal, .systemBlue, .systemIndigo, .systemPurple,
-        .systemPink, UIColor(red: 0.95, green: 0.88, blue: 0.76, alpha: 1),
-        UIColor(red: 0.18, green: 0.18, blue: 0.22, alpha: 1),
-        UIColor(red: 0.85, green: 0.95, blue: 0.88, alpha: 1),
+        // Warm neutrals
+        UIColor(red: 0.98, green: 0.96, blue: 0.92, alpha: 1), // Cream
+        UIColor(red: 0.93, green: 0.89, blue: 0.82, alpha: 1), // Linen
+        UIColor(red: 0.87, green: 0.79, blue: 0.68, alpha: 1), // Sand
+        UIColor(red: 0.72, green: 0.68, blue: 0.64, alpha: 1), // Stone
+        // Darks
+        UIColor(red: 0.20, green: 0.20, blue: 0.23, alpha: 1), // Charcoal
+        UIColor(red: 0.09, green: 0.09, blue: 0.11, alpha: 1), // Near Black
+        // Muted pastels
+        UIColor(red: 0.98, green: 0.84, blue: 0.84, alpha: 1), // Blush
+        UIColor(red: 0.99, green: 0.87, blue: 0.76, alpha: 1), // Peach
+        UIColor(red: 0.99, green: 0.95, blue: 0.78, alpha: 1), // Butter
+        UIColor(red: 0.78, green: 0.88, blue: 0.78, alpha: 1), // Sage
+        UIColor(red: 0.76, green: 0.86, blue: 0.94, alpha: 1), // Dusty Blue
+        UIColor(red: 0.86, green: 0.83, blue: 0.96, alpha: 1), // Lavender
+        // Earthy & moody
+        UIColor(red: 0.76, green: 0.40, blue: 0.30, alpha: 1), // Terracotta
+        UIColor(red: 0.78, green: 0.54, blue: 0.55, alpha: 1), // Dusty Rose
+        UIColor(red: 0.16, green: 0.34, blue: 0.25, alpha: 1), // Forest
+        UIColor(red: 0.09, green: 0.14, blue: 0.32, alpha: 1), // Deep Navy
     ]
 
     // MARK: - Tapestry Loading Overlay
@@ -442,9 +489,6 @@ struct StickerCanvasView: View {
                     GoldSpinner()
                     LoadingDotsText()
                 }
-                .padding(.horizontal, 28)
-                .padding(.vertical, 22)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
             }
             .transition(.opacity)
         }
@@ -594,6 +638,18 @@ private struct CornerTicks: Shape {
 }
 
 
+// MARK: - GlassToolbarIcon
+
+private struct GlassToolbarIcon: View {
+    let systemName: String
+
+    var body: some View {
+        Image(systemName: systemName)
+            .font(.system(size: 17, weight: .semibold))
+            .foregroundStyle(.primary)
+    }
+}
+
 // MARK: - GoldSpinner
 
 private struct GoldSpinner: View {
@@ -639,8 +695,9 @@ private struct LoadingDotsText: View {
 
     var body: some View {
         Text("Loading Tapestry" + String(repeating: ".", count: dotCount))
-            .font(.system(size: 15, weight: .semibold))
-            .foregroundStyle(.secondary)
+            .font(.system(size: 16, weight: .semibold))
+            .foregroundStyle(.white)
+            .shadow(color: .black.opacity(0.45), radius: 4, x: 0, y: 1)
             .onReceive(timer) { _ in
                 dotCount = dotCount % 3 + 1
             }

@@ -22,6 +22,9 @@ enum CanvasSerializer {
             state.colorComponents = [r, g, b, a].map { Double($0) }
         case .image:
             state.type = "image"
+        case .liveScene(let scene):
+            state.type = "live_scene"
+            state.sceneName = scene.rawValue
         }
         return state
     }

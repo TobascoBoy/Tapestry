@@ -23,6 +23,7 @@ struct CanvasHostView: UIViewRepresentable {
     let onTextEdit: (UUID) -> Void
     var onPhotoReplaced: ((UUID, UIImage) -> Void)? = nil
     var onViewReady: ((CanvasUIView) -> Void)? = nil
+    var isReadOnly: Bool = false
 
     func makeCoordinator() -> CanvasCoordinator {
         CanvasCoordinator(
@@ -56,6 +57,7 @@ struct CanvasHostView: UIViewRepresentable {
         context.coordinator.onTextEdit = onTextEdit
         context.coordinator.onPhotoReplaced = onPhotoReplaced
 
+        view.isReadOnly = isReadOnly
         view.syncBackground(canvasBackground)
         view.applyCanvasTransform(scale: canvasScale, offset: canvasOffset)
         view.syncStickersIfNeeded(stickers: stickers, selectedID: selectedStickerID)

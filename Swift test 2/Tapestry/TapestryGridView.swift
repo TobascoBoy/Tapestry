@@ -43,7 +43,7 @@ struct TapestryGridView: View {
     /// The ordered list of tapestries to display (excluding pinned, if any).
     let tapestries: [Tapestry]
 
-    @Binding var pinnedTapestryIDStr: String
+    var onPin: ((UUID) -> Void)? = nil
     @Binding var coverPickTapestry:   Tapestry?
     @Binding var coverPickAspectRatio: CGFloat
 
@@ -180,7 +180,7 @@ struct TapestryGridView: View {
         var i = 0
         while i < taps.count {
             let t         = taps[i]
-            let shape     = store.coverShape(for: t.id)
+            let shape     = t.coverShape
             let isDragged = draggingID == t.id
 
             switch shape {
@@ -194,7 +194,7 @@ struct TapestryGridView: View {
                     var right: [Tapestry] = []
                     var j = i + 1
                     while j < taps.count, right.count < 2,
-                          store.coverShape(for: taps[j].id) == .square,
+                          taps[j].coverShape == .square,
                           taps[j].id != draggingID {
                         right.append(taps[j]); j += 1
                     }
@@ -206,17 +206,17 @@ struct TapestryGridView: View {
                     result.append(.single(t)); i += 1
                 } else if i + 1 < taps.count,
                           taps[i + 1].id != draggingID,
-                          store.coverShape(for: taps[i + 1].id) == .tall {
+                          taps[i + 1].coverShape == .tall {
                     let tall = taps[i + 1]
                     if i + 2 < taps.count,
                        taps[i + 2].id != draggingID,
-                       store.coverShape(for: taps[i + 2].id) == .square {
+                       taps[i + 2].coverShape == .square {
                         result.append(.tallRight([t, taps[i + 2]], tall)); i += 3
                     } else {
                         result.append(.tallRight([t], tall)); i += 2
                     }
                 } else if i + 1 < taps.count,
-                          store.coverShape(for: taps[i + 1].id) == .square,
+                          taps[i + 1].coverShape == .square,
                           taps[i + 1].id != draggingID {
                     result.append(.pair(t, taps[i + 1])); i += 2
                 } else {
@@ -370,7 +370,7 @@ struct TapestryGridView: View {
     @ViewBuilder
     private func contextMenuItems(for tapestry: Tapestry) -> some View {
         Button {
-            let shape = store.coverShape(for: tapestry.id)
+            let shape = tapestry.coverShape
             let cellW = (gridWidth - 12) / 2
             coverPickAspectRatio = switch shape {
             case .square: 1.0
@@ -393,9 +393,11 @@ struct TapestryGridView: View {
             }
         } label: { Label("Edit Layout", systemImage: "square.grid.2x2") }
 
-        Button {
-            withAnimation { pinnedTapestryIDStr = tapestry.id.uuidString }
-        } label: { Label("Pin to Profile", systemImage: "pin") }
+        if onPin != nil {
+            Button {
+                withAnimation { onPin?(tapestry.id) }
+            } label: { Label("Pin to Profile", systemImage: "pin") }
+        }
 
         if tapestry.ownerID == store.currentUserID {
             Button(role: .destructive) {
@@ -412,7 +414,7 @@ struct TapestryGridView: View {
 
     @ViewBuilder
     private func shapeEditOverlay(for tapestry: Tapestry) -> some View {
-        let shape = store.coverShape(for: tapestry.id)
+        let shape = tapestry.coverShape
         ZStack {
             Color.black.opacity(0.28)
             VStack {
@@ -433,7 +435,7 @@ struct TapestryGridView: View {
     private func cycleShape(for tapestry: Tapestry) {
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
         withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-            store.setCoverShape(tapestryID: tapestry.id, shape: store.coverShape(for: tapestry.id).next)
+            store.setCoverShape(tapestryID: tapestry.id, shape: tapestry.coverShape.next)
         }
     }
 
@@ -452,7 +454,7 @@ struct TapestryGridView: View {
 
         while i < taps.count {
             let t         = taps[i]
-            let shape     = store.coverShape(for: t.id)
+            let shape     = t.coverShape
             let isDragged = draggingID == t.id
 
             switch shape {
@@ -467,7 +469,7 @@ struct TapestryGridView: View {
                 var rightY = y; var j = i + 1; var rightCount = 0
                 let maxRight = isDragged ? 0 : 2
                 while j < taps.count, rightCount < maxRight,
-                      store.coverShape(for: taps[j].id) == .square,
+                      taps[j].coverShape == .square,
                       taps[j].id != draggingID {
                     centers.append((j, CGPoint(x: cellW + gap + cellW / 2, y: rightY + cellTotalH / 2)))
                     rightY += cellTotalH + gap; j += 1; rightCount += 1
@@ -483,19 +485,19 @@ struct TapestryGridView: View {
                     y += cellTotalH + gap; i += 1
                 } else if i + 1 < taps.count,
                           taps[i + 1].id != draggingID,
-                          store.coverShape(for: taps[i + 1].id) == .tall {
+                          taps[i + 1].coverShape == .tall {
                     centers.append((i,     CGPoint(x: cellW / 2,               y: y + cellTotalH / 2)))
                     centers.append((i + 1, CGPoint(x: cellW + gap + cellW / 2, y: y + tallTotalH2 / 2)))
                     if i + 2 < taps.count,
                        taps[i + 2].id != draggingID,
-                       store.coverShape(for: taps[i + 2].id) == .square {
+                       taps[i + 2].coverShape == .square {
                         centers.append((i + 2, CGPoint(x: cellW / 2, y: y + cellTotalH + gap + cellTotalH / 2)))
                         y += max(tallTotalH2, 2 * cellTotalH + gap) + gap; i += 3
                     } else {
                         y += max(tallTotalH2, cellTotalH) + gap; i += 2
                     }
                 } else if i + 1 < taps.count,
-                          store.coverShape(for: taps[i + 1].id) == .square,
+                          taps[i + 1].coverShape == .square,
                           taps[i + 1].id != draggingID {
                     centers.append((i,     CGPoint(x: cellW / 2,               y: y + cellTotalH / 2)))
                     centers.append((i + 1, CGPoint(x: cellW + gap + cellW / 2, y: y + cellTotalH / 2)))

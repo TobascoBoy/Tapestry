@@ -8,6 +8,7 @@ import CoreImage
 final class StickerCoordinator: NSObject, UIGestureRecognizerDelegate {
     var sticker: Binding<Sticker>
     let onTapSelect: () -> Void
+    var isReadOnly: Bool = false
     var onGestureStart: (() -> Void)?
     var onGestureEnd: (() -> Void)?
     var onDragChanged: ((CGPoint) -> Void)?   // screen-space position while dragging
@@ -41,7 +42,7 @@ final class StickerCoordinator: NSObject, UIGestureRecognizerDelegate {
     }
 
     @objc func handlePan(_ gr: UIPanGestureRecognizer) {
-        guard let view = gr.view else { return }
+        guard !isReadOnly, let view = gr.view else { return }
         switch gr.state {
         case .began:
             isGesturing = true
@@ -69,7 +70,7 @@ final class StickerCoordinator: NSObject, UIGestureRecognizerDelegate {
     }
 
     @objc func handlePinch(_ gr: UIPinchGestureRecognizer) {
-        guard let view = gr.view else { return }
+        guard !isReadOnly, let view = gr.view else { return }
         switch gr.state {
         case .began:
             isGesturing = true
@@ -89,7 +90,7 @@ final class StickerCoordinator: NSObject, UIGestureRecognizerDelegate {
     }
 
     @objc func handleRotate(_ gr: UIRotationGestureRecognizer) {
-        guard let view = gr.view else { return }
+        guard !isReadOnly, let view = gr.view else { return }
         switch gr.state {
         case .began:
             isGesturing = true

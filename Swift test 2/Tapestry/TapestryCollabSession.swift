@@ -42,6 +42,8 @@ struct StickerOp: Codable {
 
     // updatePhoto — imageURL of the replacement image in Supabase Storage
     var imageURL: String?
+    // updatePhoto — monotonically increasing generation; receiver discards older arrivals
+    var photoGeneration: Int?
 
     // updateBackground — set canvas background to a color or remote image
     var bgColorComponents: [Double]?   // [r, g, b, a] in 0-1 range
@@ -176,8 +178,9 @@ final class TapestryCollabSession {
         StickerOp(type: .reorder, stickerID: stickerID, senderID: senderID, zIndex: zIndex)
     }
 
-    func opUpdatePhoto(stickerID: UUID, imageURL: String) -> StickerOp {
-        StickerOp(type: .updatePhoto, stickerID: stickerID, senderID: senderID, imageURL: imageURL)
+    func opUpdatePhoto(stickerID: UUID, imageURL: String, generation: Int = 0) -> StickerOp {
+        StickerOp(type: .updatePhoto, stickerID: stickerID, senderID: senderID,
+                  imageURL: imageURL, photoGeneration: generation)
     }
 
     func opUpdateBackground(colorComponents: [Double]) -> StickerOp {

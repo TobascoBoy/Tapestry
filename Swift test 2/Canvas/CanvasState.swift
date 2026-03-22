@@ -26,10 +26,11 @@ struct CanvasState: Codable {
     var stickers:   [StickerState]
 
     struct BackgroundState: Codable {
-        var type: String                  // "color" | "image"
+        var type: String                  // "color" | "image" | "live_scene"
         var colorComponents: [Double]?    // r, g, b, a  (0-1)
         var imageFilename:   String?
         var imageURL:        String?      // Supabase Storage URL
+        var sceneName:       String?      // LiveBackgroundScene raw value
     }
 }
 

@@ -196,6 +196,7 @@ final class MusicStickerUIView: UIView {
 
 final class MusicStickerCoordinator: NSObject, UIGestureRecognizerDelegate {
     let stickerID: UUID
+    var isReadOnly: Bool = false
     var onPositionChanged: ((CGPoint) -> Void)?
     var onTapSelect: (() -> Void)?
     var onGestureStart: (() -> Void)?
@@ -241,7 +242,7 @@ final class MusicStickerCoordinator: NSObject, UIGestureRecognizerDelegate {
     }
 
     @objc func handlePan(_ gr: UIPanGestureRecognizer) {
-        guard let view = gr.view else { return }
+        guard !isReadOnly, let view = gr.view else { return }
         switch gr.state {
         case .began:
             onGestureStart?()
@@ -261,6 +262,7 @@ final class MusicStickerCoordinator: NSObject, UIGestureRecognizerDelegate {
     }
 
     @objc func handlePinch(_ gr: UIPinchGestureRecognizer) {
+        guard !isReadOnly else { return }
         switch gr.state {
         case .began:
             onGestureStart?()
@@ -275,6 +277,7 @@ final class MusicStickerCoordinator: NSObject, UIGestureRecognizerDelegate {
     }
 
     @objc func handleRotate(_ gr: UIRotationGestureRecognizer) {
+        guard !isReadOnly else { return }
         switch gr.state {
         case .began:
             onGestureStart?()

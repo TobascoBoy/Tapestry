@@ -3,9 +3,29 @@ import UIKit
 
 // MARK: - CanvasBackground
 
+enum LiveBackgroundScene: String, CaseIterable {
+    case nightSky    = "night_sky"
+    case movingClouds = "moving_clouds"
+
+    var displayName: String {
+        switch self {
+        case .nightSky:    return "Night Sky"
+        case .movingClouds: return "Moving Clouds"
+        }
+    }
+
+    var systemIcon: String {
+        switch self {
+        case .nightSky:    return "moon.stars.fill"
+        case .movingClouds: return "cloud.sun.fill"
+        }
+    }
+}
+
 enum CanvasBackground {
     case color(UIColor)
     case image(UIImage)
+    case liveScene(LiveBackgroundScene)
 }
 
 // MARK: - StickerKind

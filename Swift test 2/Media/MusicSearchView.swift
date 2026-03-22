@@ -171,7 +171,7 @@ struct MusicSearchView: View {
     private func selectTrack(_ track: ITunesTrack) {
         let artURL  = track.artworkUrl100.flatMap { URL(string: $0.replacingOccurrences(of: "100x100", with: "300x300")) }
         let prevURL = track.previewUrl.flatMap { URL(string: $0) }
-
+ 
         let musicTrack = MusicTrack(
             id: String(track.trackId),
             title: track.trackName,

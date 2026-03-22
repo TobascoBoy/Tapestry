@@ -37,6 +37,18 @@ private struct ModeUpdate: Encodable {
     let canvas_mode: String
 }
 
+private struct CoverShapeUpdate: Encodable {
+    let cover_shape: String
+}
+
+private struct DisplayOrderUpdate: Encodable {
+    let display_order: Int
+}
+
+private struct PinnedUpdate: Encodable {
+    let is_pinned: Bool
+}
+
 /// What we send to Supabase on insert
 private struct TapestryInsert: Encodable {
     let id: UUID
@@ -70,6 +82,9 @@ private struct TapestryRow: Decodable {
     let canvasData: String?
     let canvasMode: String?      // nil for rows created before the column was added → defaults to .infinite
     let thumbnailURL: String?    // nil if cover not yet uploaded
+    let coverShape: String?      // nil for rows before this column was added → defaults to .square
+    let displayOrder: Int?       // nil for rows before this column was added → defaults to 0
+    let isPinned: Bool?          // nil for rows before this column was added → defaults to false
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -82,6 +97,9 @@ private struct TapestryRow: Decodable {
         case canvasData   = "canvas_data"
         case canvasMode   = "canvas_mode"
         case thumbnailURL = "thumbnail_url"
+        case coverShape   = "cover_shape"
+        case displayOrder = "display_order"
+        case isPinned     = "is_pinned"
     }
 
     func toTapestry() -> Tapestry {
@@ -96,7 +114,10 @@ private struct TapestryRow: Decodable {
             type: TapestryType(rawValue: type) ?? .personal,
             canvasData: canvasData,
             ownerID: ownerID,
-            canvasMode: canvasMode.flatMap { CanvasMode(rawValue: $0) } ?? .infinite
+            canvasMode: canvasMode.flatMap { CanvasMode(rawValue: $0) } ?? .infinite,
+            coverShape: coverShape.flatMap { CoverShape(rawValue: $0) } ?? .square,
+            displayOrder: displayOrder ?? 0,
+            isPinned: isPinned ?? false
         )
     }
 
@@ -189,6 +210,21 @@ final class TapestryStore {
     func setDisplayOrder(to ordered: [Tapestry]) {
         tapestryOrder = ordered.map(\.id)
         saveDisplayOrder()
+        // Update displayOrder on each tapestry in-memory and sync to Supabase
+        for (index, tapestry) in ordered.enumerated() {
+            if let i = tapestries.firstIndex(where: { $0.id == tapestry.id }) {
+                tapestries[i].displayOrder = index
+            }
+        }
+        Task {
+            for (index, tapestry) in ordered.enumerated() {
+                try? await supabase
+                    .from("tapestries")
+                    .update(DisplayOrderUpdate(display_order: index))
+                    .eq("id", value: tapestry.id.uuidString)
+                    .execute()
+            }
+        }
     }
 
     // MARK: - Fetch from Supabase
@@ -249,6 +285,11 @@ final class TapestryStore {
                 }
                 let activeIDs = Set(tapestries.map(\.id))
                 tapestryOrder = tapestryOrder.filter { activeIDs.contains($0) }
+                // If local order is empty (e.g. new device / reinstall), seed it from server displayOrder
+                if tapestryOrder.isEmpty {
+                    let serverOrdered = tapestries.sorted { $0.displayOrder < $1.displayOrder }
+                    tapestryOrder = serverOrdered.map(\.id)
+                }
                 saveDisplayOrder()
             }
         } catch {
@@ -500,33 +541,51 @@ final class TapestryStore {
         }
     }
 
-    // MARK: - Cover Shape (local, per-tapestry grid cell)
-
-    private static let coverShapesKey = "tapestry_cover_shapes"
-    // Not @ObservationIgnored so mutations trigger SwiftUI re-renders.
-    private var coverShapeCache: [UUID: CoverShape] = [:]
+    // MARK: - Cover Shape
 
     func coverShape(for tapestryID: UUID) -> CoverShape {
-        if let cached = coverShapeCache[tapestryID] { return cached }
-        guard let data  = UserDefaults.standard.data(forKey: Self.coverShapesKey),
-              let map   = try? JSONDecoder().decode([String: String].self, from: data),
-              let raw   = map[tapestryID.uuidString],
-              let shape = CoverShape(rawValue: raw)
-        else { return .square }
-        coverShapeCache[tapestryID] = shape
-        return shape
+        tapestries.first(where: { $0.id == tapestryID })?.coverShape ?? .square
     }
 
     func setCoverShape(tapestryID: UUID, shape: CoverShape) {
-        coverShapeCache[tapestryID] = shape
-        var map: [String: String] = [:]
-        if let data = UserDefaults.standard.data(forKey: Self.coverShapesKey),
-           let existing = try? JSONDecoder().decode([String: String].self, from: data) {
-            map = existing
+        if let i = tapestries.firstIndex(where: { $0.id == tapestryID }) {
+            tapestries[i].coverShape = shape
         }
-        map[tapestryID.uuidString] = shape.rawValue
-        if let data = try? JSONEncoder().encode(map) {
-            UserDefaults.standard.set(data, forKey: Self.coverShapesKey)
+        Task {
+            try? await supabase
+                .from("tapestries")
+                .update(CoverShapeUpdate(cover_shape: shape.rawValue))
+                .eq("id", value: tapestryID.uuidString)
+                .execute()
+        }
+    }
+
+    // MARK: - Pinned Tapestry
+
+    var pinnedTapestry: Tapestry? {
+        tapestries.first(where: { $0.isPinned })
+    }
+
+    func setPinned(tapestryID: UUID?) {
+        // Update in-memory model
+        for i in tapestries.indices {
+            tapestries[i].isPinned = (tapestries[i].id == tapestryID)
+        }
+        // Sync to Supabase
+        Task {
+            // Clear all pinned first, then set the new one
+            try? await supabase
+                .from("tapestries")
+                .update(PinnedUpdate(is_pinned: false))
+                .eq("owner_id", value: currentUserID?.uuidString ?? "")
+                .execute()
+            if let tid = tapestryID {
+                try? await supabase
+                    .from("tapestries")
+                    .update(PinnedUpdate(is_pinned: true))
+                    .eq("id", value: tid.uuidString)
+                    .execute()
+            }
         }
     }
 }

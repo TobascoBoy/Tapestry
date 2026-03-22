@@ -8,10 +8,6 @@ final class CanvasUIView: UIView {
     // MARK: Thumbnail rendering
 
     func renderViewportThumbnail(in captureRect: CGRect) -> UIImage? {
-        let gridWasHidden = gridLayer.isHidden
-        gridLayer.isHidden = true
-        defer { gridLayer.isHidden = gridWasHidden }
-
         let format = UIGraphicsImageRendererFormat()
         format.scale = UIScreen.main.scale
         format.opaque = true
@@ -68,9 +64,6 @@ final class CanvasUIView: UIView {
     }
 
     func renderViewportThumbnail(aspectRatio: CGFloat = 1.0) -> UIImage? {
-        let gridWasHidden = gridLayer.isHidden
-        gridLayer.isHidden = true
-
         let captureW = min(bounds.width, bounds.height * aspectRatio)
         let captureH = captureW / aspectRatio
         let captureRect = CGRect(
@@ -87,7 +80,6 @@ final class CanvasUIView: UIView {
             layer.render(in: ctx.cgContext)
         }
 
-        gridLayer.isHidden = gridWasHidden
         return image
     }
 
@@ -99,8 +91,7 @@ final class CanvasUIView: UIView {
     private let backgroundColorView = UIView()
     private let backgroundImageView = UIImageView()
     private let centerGlowLayer = CAGradientLayer()
-    let gridLayer = CanvasGridView()
-
+    private var liveSceneView: LiveBackgroundView?
     private var stickerViews:        [UUID: StickerUIView]          = [:]
     private var stickerCoordinators: [UUID: StickerCoordinator]     = [:]
     private var musicViews:          [UUID: MusicStickerUIView]     = [:]
@@ -110,6 +101,7 @@ final class CanvasUIView: UIView {
 
     private(set) var scrollView: UIScrollView?
     let isVertical: Bool
+    var isReadOnly: Bool = false
 
     private static let verticalCanvasHeight: CGFloat = 3000
 
@@ -167,11 +159,6 @@ final class CanvasUIView: UIView {
         backgroundImageView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         canvasView.addSubview(backgroundImageView)
 
-        gridLayer.frame = canvasView.bounds
-        gridLayer.backgroundColor = .clear
-        gridLayer.isHidden = isVertical
-        canvasView.addSubview(gridLayer)
-
         if !isVertical {
             let pan = UIPanGestureRecognizer(target: coordinator, action: #selector(CanvasCoordinator.handleCanvasPan))
             pan.delegate = coordinator
@@ -212,18 +199,57 @@ final class CanvasUIView: UIView {
     // MARK: Background & transform
 
     func syncBackground(_ background: CanvasBackground) {
+        // Tear down any existing live scene whenever we switch away from it
+        if case .liveScene = background {} else {
+            liveSceneView?.stopAnimating()
+            liveSceneView?.removeFromSuperview()
+            liveSceneView = nil
+        }
+
         switch background {
         case .color(let color):
             backgroundColorView.backgroundColor = color
             backgroundColorView.isHidden = false
             backgroundImageView.isHidden = true
-            gridLayer.isHidden = isVertical
+            if !isVertical { updateGlowColors(for: color) }
         case .image(let image):
             backgroundImageView.image = image
             backgroundImageView.isHidden = false
             backgroundColorView.isHidden = true
-            gridLayer.isHidden = true
+        case .liveScene(let scene):
+            backgroundColorView.isHidden = true
+            backgroundImageView.isHidden = true
+            if liveSceneView?.scene != scene {
+                liveSceneView?.stopAnimating()
+                liveSceneView?.removeFromSuperview()
+                let v = LiveBackgroundView(scene: scene)
+                v.frame = canvasView.bounds
+                v.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+                // Insert behind all sticker content but above the color/image views
+                canvasView.insertSubview(v, at: 0)
+                liveSceneView = v
+            }
+            liveSceneView?.startAnimating()
         }
+    }
+
+    /// Updates the center glow gradient so it blends naturally with any background color.
+    /// The inner color is a warm-tinted lighter version of the base; the outer matches the base exactly.
+    private func updateGlowColors(for baseColor: UIColor) {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        baseColor.getRed(&r, green: &g, blue: &b, alpha: &a)
+        // Blend 55% toward the original warm-glow tint so the center stays inviting on any color.
+        let blend: CGFloat = 0.55
+        let centerColor = UIColor(
+            red:   min(r * (1 - blend) + 1.00 * blend, 1),
+            green: min(g * (1 - blend) + 0.91 * blend, 1),
+            blue:  min(b * (1 - blend) + 0.76 * blend, 1),
+            alpha: a
+        )
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        centerGlowLayer.colors = [centerColor.cgColor, baseColor.cgColor]
+        CATransaction.commit()
     }
 
     func applyCanvasTransform(scale: CGFloat, offset: CGSize) {
@@ -408,6 +434,7 @@ final class CanvasUIView: UIView {
                     let sc = StickerCoordinator(sticker: binding, onTapSelect: { [weak self] in
                         self?.coordinator?.onTapSticker(sticker.id)
                     })
+                    sc.isReadOnly = isReadOnly
                     let sid = sticker.id
                     sc.onGestureStart = gestureStart
                     sc.onGestureEnd = { [weak coordinator, sid] in
@@ -444,6 +471,7 @@ final class CanvasUIView: UIView {
                     let sc = StickerCoordinator(sticker: binding, onTapSelect: { [weak self] in
                         self?.coordinator?.onTapSticker(sticker.id)
                     })
+                    sc.isReadOnly = isReadOnly
                     let sid = sticker.id
                     sc.onGestureStart = gestureStart
                     sc.onGestureEnd = { [weak coordinator, sid] in
@@ -476,6 +504,7 @@ final class CanvasUIView: UIView {
                     let sc = StickerCoordinator(sticker: binding, onTapSelect: { [weak self] in
                         self?.coordinator?.onTapSticker(sticker.id)
                     })
+                    sc.isReadOnly = isReadOnly
                     let sid = sticker.id
                     sc.onGestureStart = gestureStart
                     sc.onGestureEnd = { [weak coordinator, sid] in
@@ -510,6 +539,7 @@ final class CanvasUIView: UIView {
                 if musicViews[sticker.id] == nil {
                     let sid = sticker.id
                     let mc = MusicStickerCoordinator(stickerID: sid, previewURL: track.previewURL)
+                    mc.isReadOnly     = isReadOnly
                     mc.onTapSelect    = { [weak self] in self?.coordinator?.onTapSticker(sid) }
                     mc.onGestureStart = gestureStart
                     mc.onGestureEnd   = { [weak coordinator, sid] in
@@ -568,6 +598,7 @@ final class CanvasUIView: UIView {
                 if videoViews[sticker.id] == nil {
                     let sid = sticker.id
                     let vc = VideoStickerCoordinator(stickerID: sid)
+                    vc.isReadOnly     = isReadOnly
                     vc.onTapSelect    = { [weak self] in self?.coordinator?.onTapSticker(sid) }
                     vc.onDoubleTap    = { [weak coordinator] in coordinator?.onDoubleTap?(sid) }
                     vc.onGestureStart = gestureStart
@@ -625,6 +656,27 @@ final class CanvasUIView: UIView {
                 canvasView.bringSubviewToFront(vv)
             }
         }
+
+        // Fade the center glow out gradually starting after 3 visual stickers.
+        // Fully gone by 6 stickers; fully visible at 3 or fewer.
+        if !isVertical {
+            let visualCount = stickers.filter {
+                switch $0.kind {
+                case .photo, .photoLoading, .video, .music: return true
+                case .text: return false
+                }
+            }.count
+            let fadeStart = 3, fadeEnd = 6
+            let targetOpacity: Float = visualCount <= fadeStart ? 1 :
+                visualCount >= fadeEnd ? 0 :
+                Float(1 - Double(visualCount - fadeStart) / Double(fadeEnd - fadeStart))
+            if abs(centerGlowLayer.opacity - targetOpacity) > 0.01 {
+                CATransaction.begin()
+                CATransaction.setAnimationDuration(0.4)
+                centerGlowLayer.opacity = targetOpacity
+                CATransaction.commit()
+            }
+        }
     }
 }
 
@@ -643,18 +695,3 @@ extension CanvasUIView: UIScrollViewDelegate {
     }
 }
 
-// MARK: - CanvasGridView
-
-final class CanvasGridView: UIView {
-    override func draw(_ rect: CGRect) {
-        guard let ctx = UIGraphicsGetCurrentContext() else { return }
-        ctx.setStrokeColor(UIColor.secondaryLabel.withAlphaComponent(0.2).cgColor)
-        ctx.setLineWidth(1)
-        let step: CGFloat = 120
-        var x: CGFloat = 0
-        while x <= rect.width  { ctx.move(to: CGPoint(x: x, y: 0)); ctx.addLine(to: CGPoint(x: x, y: rect.height)); x += step }
-        var y: CGFloat = 0
-        while y <= rect.height { ctx.move(to: CGPoint(x: 0, y: y)); ctx.addLine(to: CGPoint(x: rect.width, y: y)); y += step }
-        ctx.strokePath()
-    }
-}
